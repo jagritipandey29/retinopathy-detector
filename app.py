@@ -13,7 +13,6 @@ st.write("Retina image upload karo, AI severity batayega.")
 MODEL_PATH = 'best_model.pth'
 FILE_ID = '1t0FecrXJeVAAqaqpmmpcP72XIhlPpBg4'
 
-# Model agar nahi hai to Drive se download karo
 if not os.path.exists(MODEL_PATH):
     st.info("Pehli baar model download ho raha hai... 41MB, 1 min lagega")
     url = f'https://drive.google.com/uc?id={FILE_ID}'
@@ -22,8 +21,8 @@ if not os.path.exists(MODEL_PATH):
 
 @st.cache_resource
 def load_model():
-    model = models.efficientnet_b0(weights=None)
-    model.classifier[1] = nn.Linear(1280, 5)
+    model = models.efficientnet_b3(weights=None)
+    model.classifier[1] = nn.Linear(1536, 5)
     model.load_state_dict(torch.load(MODEL_PATH, map_location=torch.device('cpu')))
     model.eval()
     return model
