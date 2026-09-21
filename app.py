@@ -17,9 +17,8 @@ DRIVE_URL = f"https://drive.google.com/uc?id={FILE_ID}"
 def load_pytorch_model():
     if not os.path.exists(MODEL_PATH):
         with st.spinner("Model downloading... pehli baar 1 min lagega"):
-            gdown.download(DRIVE_URL, MODEL_PATH, quiet=False, fuzzy=True)
+            gdown.download(DRIVE_URL, MODEL_PATH, quiet=False)
 
-    # Tumhara model EfficientNet B0 / B3 ho sakta hai, 41MB ke hisab se B3 try karte hain
     try:
         model = models.efficientnet_b3(weights=None)
         model.classifier[1] = nn.Linear(model.classifier[1].in_features, 5)
@@ -64,7 +63,6 @@ if uploaded_file:
         probs = torch.softmax(outputs[0], dim=0)
 
     pred = int(torch.argmax(probs))
-    # Mild fix
     if pred == 0 and probs[1] > 0.08:
         pred = 1
 
@@ -76,16 +74,6 @@ if uploaded_file:
     st.subheader(f"Prediction: {class_names[pred]}")
     st.metric("Confidence", f"{conf:.2f}%")
 
-    st.write("All probabilities:")
     for i in range(5):
         st.write(f"{class_names[i]}: {probs[i]*100:.2f}%")
         st.progress(float(probs[i]))
-
-    if pred == 0:
-        st.success("Healthy eye - No DR")
-    elif pred == 1:
-        st.warning("Mild DR - Early stage")
-    else:
-        st.error("Consult Doctor Immediately!")
-
-st.caption("Model Accuracy: 91% | EfficientNet | Dataset: APTOS 2019")
