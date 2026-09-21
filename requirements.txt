@@ -1,4 +1,8 @@
 streamlit
 torch
 torchvision
-pillow
+Pillow
+gdown
+matplotlib
+numpy
+opencv-python
