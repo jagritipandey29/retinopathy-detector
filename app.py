@@ -6,7 +6,7 @@ from PIL import Image
 import os, gdown
 
 st.set_page_config(page_title="Retina - DR Detector", layout="centered")
-st.title("Retina - Diabetic Retinopathy Detector - 91% Accurate")
+st.title("Retinopathy Detector - 91% Accurate")
 st.write("Upload fundus image to detect Diabetic Retinopathy stage.")
 
 FILE_ID = "1t0FecrXJeVAAqaqpmmpcP72XIhlPpBg4"
@@ -26,7 +26,7 @@ def load_pytorch_model():
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
             checkpoint = checkpoint['model_state_dict']
         model.load_state_dict(checkpoint)
-    except:
+    except Exception as e:
         model = models.efficientnet_b0(weights=None)
         model.classifier[1] = nn.Linear(model.classifier[1].in_features, 5)
         checkpoint = torch.load(MODEL_PATH, map_location='cpu')
@@ -55,7 +55,7 @@ transform = transforms.Compose([
 uploaded_file = st.file_uploader("Choose fundus image", type=["jpg","png","jpeg"])
 if uploaded_file:
     image = Image.open(uploaded_file).convert("RGB")
-    st.image(image, use_column_width=True, caption="Uploaded Image")
+    st.image(image, use_container_width=True, caption="Uploaded Image")
 
     img_t = transform(image).unsqueeze(0)
     with torch.no_grad():
@@ -74,6 +74,16 @@ if uploaded_file:
     st.subheader(f"Prediction: {class_names[pred]}")
     st.metric("Confidence", f"{conf:.2f}%")
 
+    st.write("All probabilities:")
     for i in range(5):
         st.write(f"{class_names[i]}: {probs[i]*100:.2f}%")
         st.progress(float(probs[i]))
+
+    if pred == 0:
+        st.success("Healthy eye - No DR")
+    elif pred == 1:
+        st.warning("Mild DR - Early stage")
+    else:
+        st.error("Consult Doctor Immediately!")
+
+st.caption("Model Accuracy: 91% | EfficientNet | Dataset: APTOS 2019")
