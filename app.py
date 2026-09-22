@@ -2,6 +2,7 @@ import os
 import io
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 import streamlit as st
@@ -17,79 +18,152 @@ MODEL_PATH = "best_model.pth"
 DRIVE_FILE_ID = "1t0FecrXJeVAAqaqpmmpcP72XIhlPpBg4"
 NUM_CLASSES = 5
 CLASS_NAMES = ["No DR", "Mild", "Moderate", "Severe", "Proliferative DR"]
-CANDIDATE_ARCHS = ["efficientnet-b4", "efficientnet-b3", "efficientnet-b0"]
+CANDIDATE_ARCHS = ["efficientnet-b4", "efficientnet-b3", "efficientnet-b0", "efficientnet-b5"]
+MIN_VALID_SIZE_BYTES = 5_000_000  # a real EfficientNet checkpoint is tens of MB; anything under 5MB is almost certainly a bad download
 
 st.set_page_config(page_title="Diabetic Retinopathy Detector", layout="wide")
 
 
 # ----------------------------------------------------------------------
-# MODEL DOWNLOAD
+# MODEL DOWNLOAD (with verification — this is the fix for the 20%-each bug)
 # ----------------------------------------------------------------------
+def _looks_like_html(path):
+    """Google Drive serves an HTML 'can't scan for viruses' page instead of
+    the binary for large files unless gdown is told to follow it. Detect
+    that failure mode explicitly instead of silently loading garbage."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(200).lstrip()
+        return head.startswith(b"<") or b"<html" in head.lower()
+    except Exception:
+        return False
+
+
 def download_model():
-    if not os.path.exists(MODEL_PATH):
+    need_download = not os.path.exists(MODEL_PATH)
+    if not need_download:
+        size = os.path.getsize(MODEL_PATH)
+        if size < MIN_VALID_SIZE_BYTES or _looks_like_html(MODEL_PATH):
+            os.remove(MODEL_PATH)
+            need_download = True
+
+    if need_download:
         with st.spinner("Downloading model weights (first run only)..."):
-            gdown.download(id=DRIVE_FILE_ID, output=MODEL_PATH, quiet=False)
+            gdown.download(
+                id=DRIVE_FILE_ID,
+                output=MODEL_PATH,
+                quiet=False,
+                fuzzy=True,   # follows Drive's large-file confirmation redirect
+            )
+
+    if not os.path.exists(MODEL_PATH):
+        raise RuntimeError("Model download failed — no file was written.")
+
+    size = os.path.getsize(MODEL_PATH)
+    if size < MIN_VALID_SIZE_BYTES or _looks_like_html(MODEL_PATH):
+        os.remove(MODEL_PATH)
+        raise RuntimeError(
+            f"Downloaded 'best_model.pth' is only {size} bytes and looks like an HTML page, "
+            "not model weights. This means Google Drive returned its virus-scan warning page "
+            "instead of the file. Fix: open the Drive link in a browser and confirm it's shared "
+            "as 'Anyone with the link', or download the .pth manually and commit it into the "
+            "GitHub repo directly (Streamlit Cloud will then skip the gdown download entirely)."
+        )
+    return size
 
 
 # ----------------------------------------------------------------------
-# ARCHITECTURE AUTO-DETECTION
+# CHECKPOINT PARSING
 # ----------------------------------------------------------------------
 def _extract_state_dict(checkpoint):
-    """Handle checkpoints saved as raw state_dict OR wrapped in a dict."""
+    """Handle every common checkpoint shape: raw state_dict, a dict wrapping
+    it under various keys, or a full nn.Module saved with torch.save(model)."""
+    if isinstance(checkpoint, nn.Module):
+        return None, checkpoint  # (state_dict, ready_to_use_model)
+
     if isinstance(checkpoint, dict):
-        for key in ("state_dict", "model_state_dict", "model"):
-            if key in checkpoint and isinstance(checkpoint[key], dict):
-                return checkpoint[key]
+        for key in ("state_dict", "model_state_dict", "model_state", "model"):
+            if key in checkpoint:
+                inner = checkpoint[key]
+                if isinstance(inner, nn.Module):
+                    return None, inner
+                if isinstance(inner, dict):
+                    return inner, None
         # Might already be a flat state_dict (dict of tensors)
-        if all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
-            return checkpoint
-    raise ValueError("Unrecognized checkpoint format")
+        if len(checkpoint) > 0 and all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
+            return checkpoint, None
+
+    raise ValueError(f"Unrecognized checkpoint format: {type(checkpoint)}")
 
 
+# ----------------------------------------------------------------------
+# MODEL LOADING — fails loudly instead of silently falling back to
+# random weights, which is what produced the uniform 20% bug.
+# ----------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_model():
     download_model()
     checkpoint = torch.load(MODEL_PATH, map_location="cpu")
-    state_dict = _extract_state_dict(checkpoint)
+
+    diagnostics = {"checkpoint_type": str(type(checkpoint))}
+    if isinstance(checkpoint, dict):
+        diagnostics["checkpoint_keys"] = list(checkpoint.keys())[:20]
+
+    state_dict, ready_model = _extract_state_dict(checkpoint)
+
+    if ready_model is not None:
+        ready_model.eval()
+        st.session_state["_detected_arch"] = "loaded as full nn.Module (no arch guessing needed)"
+        st.session_state["_load_diagnostics"] = diagnostics
+        return ready_model
+
+    if state_dict is None or len(state_dict) == 0:
+        raise RuntimeError(
+            f"Checkpoint parsed but contained no weights. Diagnostics: {diagnostics}"
+        )
 
     # Strip common prefixes (e.g. "module." from DataParallel)
-    cleaned = {}
-    for k, v in state_dict.items():
-        new_k = k.replace("module.", "")
-        cleaned[new_k] = v
-    state_dict = cleaned
+    state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    diagnostics["num_state_dict_keys"] = len(state_dict)
 
-    last_error = None
+    results_per_arch = {}
+    best_arch, best_model, best_missing = None, None, None
+
     for arch in CANDIDATE_ARCHS:
         try:
-            model = EfficientNet.from_name(arch, num_classes=NUM_CLASSES)
-            missing, unexpected = model.load_state_dict(state_dict, strict=False)
-            # A correct architecture match should have (near) zero missing/
-            # unexpected keys for the conv backbone. If too many core keys
-            # are missing, this arch is wrong -> try the next one.
-            critical_missing = [
-                k for k in missing if not k.startswith("_fc")
-            ]
-            if len(critical_missing) == 0:
-                model.eval()
-                st.session_state["_detected_arch"] = arch
-                return model
+            candidate = EfficientNet.from_name(arch, num_classes=NUM_CLASSES)
+            missing, unexpected = candidate.load_state_dict(state_dict, strict=False)
+            critical_missing = [k for k in missing if not k.startswith("_fc")]
+            results_per_arch[arch] = {
+                "missing": len(missing),
+                "critical_missing": len(critical_missing),
+                "unexpected": len(unexpected),
+            }
+            if best_missing is None or len(critical_missing) < best_missing:
+                best_arch, best_model, best_missing = arch, candidate, len(critical_missing)
         except Exception as e:
-            last_error = e
+            results_per_arch[arch] = {"error": str(e)}
             continue
 
-    # If nothing matched cleanly, fall back to strict=False on the first
-    # architecture so the app still runs, but warn the user.
-    try:
-        model = EfficientNet.from_name(CANDIDATE_ARCHS[0], num_classes=NUM_CLASSES)
-        model.load_state_dict(state_dict, strict=False)
-        model.eval()
-        st.session_state["_detected_arch"] = CANDIDATE_ARCHS[0] + " (forced, mismatch)"
-        return model
-    except Exception as e:
+    diagnostics["per_arch_results"] = results_per_arch
+    st.session_state["_load_diagnostics"] = diagnostics
+
+    total_backbone_keys = len(state_dict)
+    # Require that the best match loaded the overwhelming majority of keys.
+    # A handful of missing _fc keys is fine (classifier head resized to 5
+    # classes); dozens/hundreds missing means this arch is simply wrong.
+    if best_model is None or best_missing is None or best_missing > max(5, 0.02 * total_backbone_keys):
         raise RuntimeError(
-            f"Could not load checkpoint into any known architecture. Last error: {last_error or e}"
+            "Could not confidently match the checkpoint to any known EfficientNet "
+            f"architecture — best candidate ('{best_arch}') still had {best_missing} "
+            "unmatched backbone keys. This almost always means the downloaded file "
+            "is not the real checkpoint (see per-architecture diagnostics below) "
+            f"rather than an actual architecture mismatch. Details: {results_per_arch}"
         )
+
+    best_model.eval()
+    st.session_state["_detected_arch"] = f"{best_arch} (missing critical keys: {best_missing})"
+    return best_model
 
 
 # ----------------------------------------------------------------------
@@ -153,8 +227,6 @@ class GradCAM:
 
 
 def get_target_layer(model):
-    # _conv_head is the last conv layer before pooling -> good spatial
-    # resolution with strong semantic features for EfficientNet.
     if hasattr(model, "_conv_head"):
         return model._conv_head
     return model._blocks[-1]
@@ -177,15 +249,21 @@ def overlay_gradcam(pil_image_224, cam):
 st.title("🩺 Diabetic Retinopathy Detection")
 st.caption("EfficientNet-based classifier trained on the APTOS 2019 dataset")
 
-with st.spinner("Loading model..."):
-    try:
+try:
+    with st.spinner("Loading model..."):
         model = load_model()
-    except Exception as e:
-        st.error(f"Failed to load model: {e}")
-        st.stop()
+except Exception as e:
+    st.error(f"Failed to load model: {e}")
+    diag = st.session_state.get("_load_diagnostics")
+    if diag:
+        with st.expander("Debug details"):
+            st.json(diag)
+    st.stop()
 
 detected_arch = st.session_state.get("_detected_arch", "unknown")
 st.caption(f"Backbone detected: `{detected_arch}`")
+with st.expander("Model load diagnostics"):
+    st.json(st.session_state.get("_load_diagnostics", {}))
 
 uploaded_file = st.file_uploader(
     "Upload a fundus image", type=["jpg", "jpeg", "png", "bmp", "webp"]
@@ -203,7 +281,6 @@ if uploaded_file is not None:
                 pred = int(torch.argmax(probs).item())
                 conf = float(probs[pred].item()) * 100
 
-            # ---- Grad-CAM (needs gradients, so run outside no_grad) ----
             target_layer = get_target_layer(model)
             cam_extractor = GradCAM(model, target_layer)
             try:
@@ -215,6 +292,15 @@ if uploaded_file is not None:
                 gradcam_error = str(e)
             finally:
                 cam_extractor.remove_hooks()
+
+        # Sanity warning if the model still looks untrained (near-uniform output)
+        prob_values = probs.detach().numpy()
+        if prob_values.std() < 0.02:
+            st.warning(
+                "⚠️ All class probabilities are nearly identical — this usually means the "
+                "loaded weights are still (partially) untrained. Check the 'Model load "
+                "diagnostics' panel above for missing/unexpected key counts."
+            )
 
         col1, col2 = st.columns(2)
         with col1:
