@@ -20,10 +20,28 @@ from efficientnet_pytorch import EfficientNet as LegacyEfficientNet
 MODEL_PATH = "best_model.pth"
 DRIVE_FILE_ID = "1t0FecrXJeVAAqaqpmmpcP72XIhlPpBg4"
 NUM_CLASSES = 5
-CLASS_NAMES = ["No DR", "Mild", "Moderate", "Severe", "Proliferative DR"]
 CLASS_ICONS = ["✅", "🟡", "🟠", "🔴", "🟣"]
 CLASS_COLORS = ["#22c55e", "#eab308", "#f97316", "#ef4444", "#a855f7"]
 MIN_VALID_SIZE_BYTES = 5_000_000
+
+# --- Class ORDER is a guess unless verified against the training notebook ---
+# If the model was trained on the original train.csv 'diagnosis' column,
+# index order is 0=No DR..4=Proliferative (DIAGNOSIS_ORDER below).
+# If it was trained via torchvision.datasets.ImageFolder on folders named
+# "Mild"/"Moderate"/"No_DR"/"Proliferate_DR"/"Severe", PyTorch sorts those
+# folder names ALPHABETICALLY at train time, giving a totally different
+# index->label mapping (ALPHABETICAL_ORDER below). Picking the wrong one
+# here will make an otherwise-correct model look like it's misclassifying
+# every image. Verify with `print(train_dataset.classes)` in the training
+# notebook, then set ACTIVE_ORDER_KEY accordingly (or switch it live in
+# the "Class order" debug panel in the app).
+CLASS_ORDER_PRESETS = {
+    "diagnosis_csv (0=NoDR,1=Mild,2=Moderate,3=Severe,4=Proliferative)":
+        ["No DR", "Mild", "Moderate", "Severe", "Proliferative DR"],
+    "alphabetical_folder (ImageFolder default sort)":
+        ["Mild", "Moderate", "No DR", "Proliferative DR", "Severe"],
+}
+ACTIVE_ORDER_KEY = "diagnosis_csv (0=NoDR,1=Mild,2=Moderate,3=Severe,4=Proliferative)"
 
 TV_VARIANTS = [
     ("efficientnet_b0", tv_models.efficientnet_b0, 224),
@@ -42,12 +60,14 @@ LEGACY_VARIANTS = [
     ("efficientnet-b5", 456),
 ]
 
+# Keyed by class NAME (not index) so descriptions stay correct no matter
+# which index<->label ordering preset is active.
 CLASS_DESCRIPTIONS = {
-    0: "no visible microaneurysms, hemorrhages, or exudates",
-    1: "a small number of microaneurysms (tiny red dots) — typically the earliest visible sign of retinal damage",
-    2: "more numerous microaneurysms together with early hemorrhages and/or hard exudates",
-    3: "extensive hemorrhages across multiple retinal quadrants, venous beading, and/or intraretinal microvascular abnormalities",
-    4: "neovascularization (abnormal new blood vessel growth) and/or vitreous/preretinal hemorrhage, indicating advanced disease",
+    "No DR": "no visible microaneurysms, hemorrhages, or exudates",
+    "Mild": "a small number of microaneurysms (tiny red dots) — typically the earliest visible sign of retinal damage",
+    "Moderate": "more numerous microaneurysms together with early hemorrhages and/or hard exudates",
+    "Severe": "extensive hemorrhages across multiple retinal quadrants, venous beading, and/or intraretinal microvascular abnormalities",
+    "Proliferative DR": "neovascularization (abnormal new blood vessel growth) and/or vitreous/preretinal hemorrhage, indicating advanced disease",
 }
 
 st.set_page_config(page_title="NetraSeva - DR Detection", layout="wide")
@@ -423,18 +443,18 @@ def describe_attention_region(heatmap):
     return region, hot_frac
 
 
-def generate_ai_explanation(pred, probs_np, heatmap):
+def generate_ai_explanation(pred, probs_np, heatmap, class_names):
     region, hot_frac = describe_attention_region(heatmap)
     conf = probs_np[pred] * 100
-    ranked = sorted(range(len(CLASS_NAMES)), key=lambda i: probs_np[i], reverse=True)
+    ranked = sorted(range(len(class_names)), key=lambda i: probs_np[i], reverse=True)
     runner_up = ranked[1]
     runner_gap = (probs_np[ranked[0]] - probs_np[runner_up]) * 100
 
     lines = [
-        f"**Prediction summary:** The model identified this fundus image as **{CLASS_NAMES[pred]}** "
+        f"**Prediction summary:** The model identified this fundus image as **{class_names[pred]}** "
         f"with **{conf:.1f}%** confidence.",
-        f"**Typical findings at this stage:** {CLASS_NAMES[pred]} is usually characterized by "
-        f"{CLASS_DESCRIPTIONS[pred]}.",
+        f"**Typical findings at this stage:** {class_names[pred]} is usually characterized by "
+        f"{CLASS_DESCRIPTIONS[class_names[pred]]}.",
     ]
     if hot_frac > 0.5:
         lines.append(
@@ -449,14 +469,14 @@ def generate_ai_explanation(pred, probs_np, heatmap):
         )
     if runner_gap < 15:
         lines.append(
-            f"**Borderline case:** The second-most-likely class, **{CLASS_NAMES[runner_up]}** "
+            f"**Borderline case:** The second-most-likely class, **{class_names[runner_up]}** "
             f"({probs_np[runner_up]*100:.1f}%), is close to the top prediction (gap: {runner_gap:.1f} "
             "points). Treat this as borderline and prioritize clinical correlation."
         )
     else:
         lines.append(
             f"**Confidence spread:** The gap to the next most likely class "
-            f"({CLASS_NAMES[runner_up]}, {probs_np[runner_up]*100:.1f}%) is {runner_gap:.1f} points, "
+            f"({class_names[runner_up]}, {probs_np[runner_up]*100:.1f}%) is {runner_gap:.1f} points, "
             "indicating a fairly decisive prediction."
         )
     lines.append(
@@ -485,6 +505,19 @@ detected_arch = bundle["arch"]
 
 with st.expander(f"⚙️ Backbone: `{detected_arch}` · input {resolution}px — diagnostics"):
     st.json(bundle["diagnostics"])
+
+with st.expander("🔬 Class order (fixes 'Mild shown as Severe'-type mislabeling)"):
+    st.markdown(
+        "If a class is being predicted correctly by the model but **shown under the wrong "
+        "name**, it's because the index→label order below doesn't match how the model was "
+        "trained. Check your training notebook for `print(train_dataset.classes)` (if you used "
+        "`ImageFolder`) or confirm you used the raw `diagnosis` column order, then pick the "
+        "matching preset here. This changes only the *display labels*, not the model's math — "
+        "it's safe to try both and compare against images with a known true label."
+    )
+    order_choice = st.selectbox("Active class order", list(CLASS_ORDER_PRESETS.keys()),
+                                 index=list(CLASS_ORDER_PRESETS.keys()).index(ACTIVE_ORDER_KEY))
+class_names = CLASS_ORDER_PRESETS[order_choice]
 
 uploaded_file = st.file_uploader("Retina image upload karo", type=["jpg", "jpeg", "png", "bmp", "webp"])
 
@@ -534,11 +567,13 @@ if uploaded_file is not None:
 
         # ---- Result card ----
         color = CLASS_COLORS[pred]
+        pred_name = class_names[pred]
         st.markdown(
             f"""
             <div class="result-card" style="border-left: 5px solid {color};">
-                <span class="badge" style="background:{color};">{CLASS_ICONS[pred]} {CLASS_NAMES[pred]}</span>
-                <div class="conf-sub">Model confidence: <b>{conf:.2f}%</b> (TTA-averaged over original + flipped view)</div>
+                <span class="badge" style="background:{color};">{CLASS_ICONS[pred]} {pred_name}</span>
+                <div class="conf-sub">Model confidence: <b>{conf:.2f}%</b> (TTA-averaged over original + flipped view)
+                &nbsp;·&nbsp; raw model index: <b>{pred}</b></div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -546,27 +581,33 @@ if uploaded_file is not None:
 
         # ---- Probability chart ----
         st.write("#### Class probabilities")
-        probs_df = pd.DataFrame({"Class": CLASS_NAMES, "Probability (%)": probs_np * 100}).set_index("Class")
+        probs_df = pd.DataFrame(
+            {"Class": [f"{i}: {n}" for i, n in enumerate(class_names)], "Probability (%)": probs_np * 100}
+        ).set_index("Class")
         st.bar_chart(probs_df, use_container_width=True)
 
-        ranked = sorted(range(len(CLASS_NAMES)), key=lambda i: probs_np[i], reverse=True)
-        cols = st.columns(len(CLASS_NAMES))
-        for i in range(len(CLASS_NAMES)):
+        ranked = sorted(range(len(class_names)), key=lambda i: probs_np[i], reverse=True)
+        cols = st.columns(len(class_names))
+        for i in range(len(class_names)):
             with cols[i]:
-                st.metric(f"{CLASS_ICONS[i]} {CLASS_NAMES[i]}", f"{probs_np[i]*100:.1f}%")
+                st.metric(f"{CLASS_ICONS[i]} {class_names[i]} (idx {i})", f"{probs_np[i]*100:.1f}%")
 
-        # ---- Recommendation ----
+        # ---- Recommendation ---- (driven by the LABEL, not the raw index,
+        # so it stays correct regardless of which order preset is active)
         st.write("#### Recommendation")
-        if pred == 0:
+        if pred_name == "No DR":
             st.success("Healthy — No signs of Diabetic Retinopathy detected.")
-        elif pred == 1:
+        elif pred_name == "Mild":
             st.warning("Mild DR — Early stage. Please monitor and get periodic checkups.")
-        elif pred == 2:
+        elif pred_name == "Moderate":
             st.warning("Moderate DR — Please consult an ophthalmologist.")
         else:
-            st.error("Severe / Proliferative DR — Consult a doctor immediately.")
+            st.error(f"{pred_name} — Consult a doctor immediately.")
 
-        if ranked[0] == 1 or (ranked[1] == 1 and (probs_np[ranked[0]] - probs_np[1]) * 100 < 20):
+        mild_idx = class_names.index("Mild")
+        if ranked[0] == mild_idx or (
+            ranked[1] == mild_idx and (probs_np[ranked[0]] - probs_np[mild_idx]) * 100 < 20
+        ):
             st.info(
                 "ℹ️ Mild DR is the hardest class for this model to separate from 'No DR' and "
                 "'Moderate' (it's the rarest, most subtle class in the training data). If this "
@@ -577,7 +618,7 @@ if uploaded_file is not None:
         # ---- AI Analysis ----
         st.write("#### 🧠 AI Analysis")
         if gradcam_ok and resized_heatmap is not None:
-            st.markdown(generate_ai_explanation(pred, probs_np, resized_heatmap))
+            st.markdown(generate_ai_explanation(pred, probs_np, resized_heatmap, class_names))
         else:
             st.info("AI analysis requires Grad-CAM output, which failed for this image.")
 
