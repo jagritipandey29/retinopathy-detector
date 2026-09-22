@@ -2,7 +2,8 @@ streamlit
 torch
 torchvision
 efficientnet-pytorch
-gdown
+gdown>=5.2.0
+requests
 opencv-python-headless
 Pillow
 numpy
