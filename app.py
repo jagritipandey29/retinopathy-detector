@@ -1,6 +1,7 @@
 import os
 import io
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,9 +21,10 @@ MODEL_PATH = "best_model.pth"
 DRIVE_FILE_ID = "1t0FecrXJeVAAqaqpmmpcP72XIhlPpBg4"
 NUM_CLASSES = 5
 CLASS_NAMES = ["No DR", "Mild", "Moderate", "Severe", "Proliferative DR"]
+CLASS_ICONS = ["✅", "🟡", "🟠", "🔴", "🟣"]
+CLASS_COLORS = ["#22c55e", "#eab308", "#f97316", "#ef4444", "#a855f7"]
 MIN_VALID_SIZE_BYTES = 5_000_000
 
-# torchvision EfficientNet variants: constructor fn + native training resolution
 TV_VARIANTS = [
     ("efficientnet_b0", tv_models.efficientnet_b0, 224),
     ("efficientnet_b1", tv_models.efficientnet_b1, 240),
@@ -33,7 +35,6 @@ TV_VARIANTS = [
     ("efficientnet_b6", tv_models.efficientnet_b6, 528),
     ("efficientnet_b7", tv_models.efficientnet_b7, 600),
 ]
-# efficientnet-pytorch (lukemelas) variants, kept as a fallback family
 LEGACY_VARIANTS = [
     ("efficientnet-b0", 224),
     ("efficientnet-b3", 300),
@@ -49,7 +50,31 @@ CLASS_DESCRIPTIONS = {
     4: "neovascularization (abnormal new blood vessel growth) and/or vitreous/preretinal hemorrhage, indicating advanced disease",
 }
 
-st.set_page_config(page_title="Diabetic Retinopathy Detector", layout="wide")
+st.set_page_config(page_title="NetraSeva - DR Detection", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    .result-card {
+        border-radius: 16px;
+        padding: 1.4rem 1.6rem;
+        margin-bottom: 1rem;
+        border: 1px solid rgba(255,255,255,0.08);
+        background: rgba(255,255,255,0.03);
+    }
+    .badge {
+        display: inline-block;
+        padding: 0.35rem 0.9rem;
+        border-radius: 999px;
+        font-weight: 700;
+        font-size: 1.1rem;
+        color: white;
+    }
+    .conf-sub { opacity: 0.75; font-size: 0.9rem; margin-top: 0.2rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 # ----------------------------------------------------------------------
@@ -160,18 +185,14 @@ def _extract_state_dict(checkpoint):
 
 
 def _remap_se_keys(state_dict):
-    """This checkpoint's squeeze-excitation blocks are named fc1/fc3
-    (fc2 being the parameter-free activation in between), while
-    torchvision's SqueezeExcitation module names them fc1/fc2. Remap so
-    the excite conv lines up with torchvision's second conv layer."""
     return {k.replace(".fc3.", ".fc2."): v for k, v in state_dict.items()}
 
 
 # ----------------------------------------------------------------------
-# MODEL LOADING — tries torchvision EfficientNet variants first (this
-# checkpoint's "features.N.block..." keys match that family), then
-# falls back to the efficientnet-pytorch family. Fails loudly rather
-# than silently keeping random weights.
+# MODEL LOADING — tries efficientnet-pytorch (legacy, "_blocks"/"_fc"
+# naming — this is what the confirmed-working baseline used) FIRST,
+# then torchvision variants ("features.N.block..." naming) as fallback,
+# since the live checkpoint on Drive has swapped format before.
 # ----------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_model():
@@ -201,7 +222,24 @@ def load_model():
     results = {}
     best = {"missing": None, "model": None, "family": None, "arch": None, "resolution": None}
 
-    # --- Family 1: torchvision EfficientNet (features.N.block...) ---
+    # --- Family 1: efficientnet-pytorch (legacy "_blocks"/"_fc") ---
+    for arch_name, resolution in LEGACY_VARIANTS:
+        try:
+            candidate = LegacyEfficientNet.from_name(arch_name, num_classes=NUM_CLASSES)
+            missing, unexpected = candidate.load_state_dict(state_dict, strict=False)
+            critical_missing = [k for k in missing if not k.startswith("_fc")]
+            results[f"legacy:{arch_name}"] = {
+                "missing": len(missing),
+                "critical_missing": len(critical_missing),
+                "unexpected": len(unexpected),
+            }
+            if best["missing"] is None or len(critical_missing) < best["missing"]:
+                best.update(missing=len(critical_missing), model=candidate,
+                            family="legacy", arch=arch_name, resolution=resolution)
+        except Exception as e:
+            results[f"legacy:{arch_name}"] = {"error": str(e)}
+
+    # --- Family 2: torchvision EfficientNet ("features.N.block...") ---
     remapped = _remap_se_keys(state_dict)
     for arch_name, ctor, resolution in TV_VARIANTS:
         try:
@@ -214,37 +252,10 @@ def load_model():
                 "unexpected": len(unexpected),
             }
             if best["missing"] is None or len(critical_missing) < best["missing"]:
-                best.update(
-                    missing=len(critical_missing),
-                    model=candidate,
-                    family="torchvision",
-                    arch=arch_name,
-                    resolution=resolution,
-                )
+                best.update(missing=len(critical_missing), model=candidate,
+                            family="torchvision", arch=arch_name, resolution=resolution)
         except Exception as e:
             results[f"torchvision:{arch_name}"] = {"error": str(e)}
-
-    # --- Family 2: efficientnet-pytorch (legacy) fallback ---
-    for arch_name, resolution in LEGACY_VARIANTS:
-        try:
-            candidate = LegacyEfficientNet.from_name(arch_name, num_classes=NUM_CLASSES)
-            missing, unexpected = candidate.load_state_dict(state_dict, strict=False)
-            critical_missing = [k for k in missing if not k.startswith("_fc")]
-            results[f"legacy:{arch_name}"] = {
-                "missing": len(missing),
-                "critical_missing": len(critical_missing),
-                "unexpected": len(unexpected),
-            }
-            if best["missing"] is None or len(critical_missing) < best["missing"]:
-                best.update(
-                    missing=len(critical_missing),
-                    model=candidate,
-                    family="legacy",
-                    arch=arch_name,
-                    resolution=resolution,
-                )
-        except Exception as e:
-            results[f"legacy:{arch_name}"] = {"error": str(e)}
 
     diagnostics["per_arch_results"] = results
     st.session_state["_load_diagnostics"] = diagnostics
@@ -253,9 +264,8 @@ def load_model():
     if best["model"] is None or best["missing"] is None or best["missing"] > max(5, 0.02 * total_keys):
         raise RuntimeError(
             "Could not confidently match the checkpoint to any known EfficientNet variant "
-            f"(torchvision or efficientnet-pytorch) — best candidate "
-            f"'{best['family']}:{best['arch']}' still had {best['missing']} unmatched keys. "
-            f"See diagnostics below. Details: {results}"
+            f"— best candidate '{best['family']}:{best['arch']}' still had {best['missing']} "
+            f"unmatched keys. Details: {results}"
         )
 
     best["model"].eval()
@@ -266,9 +276,7 @@ def load_model():
 
 
 # ----------------------------------------------------------------------
-# PREPROCESSING — resolution depends on which variant matched, but the
-# resize+centercrop ratio still protects against WhatsApp/screenshot
-# black-border images the way the fixed 256/224 pipeline did.
+# PREPROCESSING
 # ----------------------------------------------------------------------
 def preprocess_image(pil_image, resolution):
     pil_image = pil_image.convert("RGB")
@@ -283,6 +291,26 @@ def preprocess_image(pil_image, resolution):
     )
     tensor = transform(pil_image).unsqueeze(0)
     return pil_image, tensor
+
+
+# ----------------------------------------------------------------------
+# TEST-TIME AUGMENTATION
+# A genuine, retrain-free way to nudge recall on a hard, easily-confused
+# minority class like Mild DR: average predictions across a few simple
+# augmented views instead of trusting a single crop/orientation.
+# This will not fix a class the model never learned well, but it does
+# reduce single-view noise that pushes borderline Mild cases the wrong way.
+# ----------------------------------------------------------------------
+def predict_with_tta(model, base_tensor):
+    views = [base_tensor, torch.flip(base_tensor, dims=[3])]  # original + horizontal flip
+    with torch.no_grad():
+        probs_sum = None
+        for v in views:
+            logits = model(v)
+            p = F.softmax(logits, dim=1)
+            probs_sum = p if probs_sum is None else probs_sum + p
+        probs = (probs_sum / len(views))[0]
+    return probs
 
 
 # ----------------------------------------------------------------------
@@ -335,10 +363,9 @@ def get_target_layer(model, family):
         if hasattr(model, "_conv_head"):
             return model._conv_head
         return model._blocks[-1]
-    # unknown / plain nn.Module fallback: use the last child module with parameters
     last = None
     for m in model.modules():
-        if isinstance(m, (nn.Conv2d,)):
+        if isinstance(m, nn.Conv2d):
             last = m
     return last
 
@@ -395,7 +422,6 @@ def generate_ai_explanation(pred, probs_np, heatmap):
         f"**Typical findings at this stage:** {CLASS_NAMES[pred]} is usually characterized by "
         f"{CLASS_DESCRIPTIONS[pred]}.",
     ]
-
     if hot_frac > 0.5:
         lines.append(
             f"**Where the model looked:** Grad-CAM shows attention concentrated mainly in the "
@@ -407,7 +433,6 @@ def generate_ai_explanation(pred, probs_np, heatmap):
             "**Where the model looked:** Attention was fairly diffuse rather than sharply "
             "localized, typical for 'No DR' or very early/subtle findings."
         )
-
     if runner_gap < 15:
         lines.append(
             f"**Borderline case:** The second-most-likely class, **{CLASS_NAMES[runner_up]}** "
@@ -420,11 +445,9 @@ def generate_ai_explanation(pred, probs_np, heatmap):
             f"({CLASS_NAMES[runner_up]}, {probs_np[runner_up]*100:.1f}%) is {runner_gap:.1f} points, "
             "indicating a fairly decisive prediction."
         )
-
     lines.append(
-        "_This explanation is generated automatically from the model's output probabilities and its "
-        "Grad-CAM attention map — it is a screening aid, not a clinical diagnosis. Always confirm with "
-        "a qualified ophthalmologist._"
+        "_Generated automatically from the model's output probabilities and Grad-CAM map — a "
+        "screening aid, not a clinical diagnosis. Always confirm with a qualified ophthalmologist._"
     )
     return "\n\n".join(lines)
 
@@ -432,8 +455,8 @@ def generate_ai_explanation(pred, probs_np, heatmap):
 # ----------------------------------------------------------------------
 # UI
 # ----------------------------------------------------------------------
-st.title("🩺 Diabetic Retinopathy Detection")
-st.caption("EfficientNet-based classifier trained on the APTOS 2019 dataset")
+st.title("👁️ NetraSeva — Diabetic Retinopathy Detection")
+st.caption("EfficientNet-based classifier trained on the APTOS 2019 dataset, with Grad-CAM explainability")
 
 try:
     with st.spinner("Loading model..."):
@@ -446,32 +469,34 @@ except Exception as e:
             st.json(diag)
     st.stop()
 
-model_family = st.session_state.get("_model_family", "torchvision")
+model_family = st.session_state.get("_model_family", "legacy")
 resolution = st.session_state.get("_model_resolution", 380)
 detected_arch = st.session_state.get("_detected_arch", "unknown")
-st.caption(f"Backbone detected: `{detected_arch}` · input resolution: {resolution}px")
-with st.expander("Model load diagnostics"):
+
+with st.expander(f"⚙️ Backbone: `{detected_arch}` · input {resolution}px — diagnostics"):
     st.json(st.session_state.get("_load_diagnostics", {}))
 
-uploaded_file = st.file_uploader(
-    "Upload a fundus image", type=["jpg", "jpeg", "png", "bmp", "webp"]
-)
+uploaded_file = st.file_uploader("Retina image upload karo", type=["jpg", "jpeg", "png", "bmp", "webp"])
 
 if uploaded_file is not None:
     raw_image = Image.open(io.BytesIO(uploaded_file.read()))
     display_image, input_tensor = preprocess_image(raw_image, resolution)
 
-    if st.button("Predict", type="primary"):
-        with st.spinner("Running inference..."):
-            with torch.no_grad():
-                logits = model(input_tensor)
-                probs = F.softmax(logits, dim=1)[0]
-                pred = int(torch.argmax(probs).item())
-                conf = float(probs[pred].item()) * 100
+    left, right = st.columns([1, 1])
+    with left:
+        st.image(display_image, caption="Uploaded Image", use_container_width=True)
+
+    if st.button("🔍 Predict", type="primary", use_container_width=True):
+        with st.spinner("Running inference (with test-time augmentation)..."):
+            probs = predict_with_tta(model, input_tensor)
+            pred = int(torch.argmax(probs).item())
+            conf = float(probs[pred].item()) * 100
+            probs_np = probs.detach().numpy()
 
             target_layer = get_target_layer(model, model_family)
             gradcam_ok = False
             resized_heatmap = None
+            overlay = None
             if target_layer is not None:
                 cam_extractor = GradCAM(model, target_layer)
                 try:
@@ -485,46 +510,70 @@ if uploaded_file is not None:
             else:
                 gradcam_error = "No suitable target layer found for Grad-CAM on this model."
 
-        probs_np = probs.detach().numpy()
         if probs_np.std() < 0.02:
             st.warning(
-                "⚠️ All class probabilities are nearly identical — this usually means the loaded "
-                "weights are still (partially) untrained. Check 'Model load diagnostics' above."
+                "⚠️ All class probabilities are nearly identical — the loaded weights may still be "
+                "(partially) untrained. Check the diagnostics panel above."
             )
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.image(display_image, caption="Uploaded Image", use_container_width=True)
-        with col2:
+        with right:
             if gradcam_ok:
                 st.image(overlay, caption="Grad-CAM Explanation", use_container_width=True)
             else:
                 st.warning(f"Grad-CAM could not be generated: {gradcam_error}")
 
-        st.subheader(f"Prediction: {CLASS_NAMES[pred]}")
-        st.metric("Confidence", f"{conf:.2f}%")
+        # ---- Result card ----
+        color = CLASS_COLORS[pred]
+        st.markdown(
+            f"""
+            <div class="result-card" style="border-left: 5px solid {color};">
+                <span class="badge" style="background:{color};">{CLASS_ICONS[pred]} {CLASS_NAMES[pred]}</span>
+                <div class="conf-sub">Model confidence: <b>{conf:.2f}%</b>
+                {" (TTA-averaged over original + flipped view)" if True else ""}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-        st.write("### Class probabilities")
-        for i, name in enumerate(CLASS_NAMES):
-            p = float(probs[i].item()) * 100
-            st.write(f"{name}: {p:.2f}%")
-            st.progress(min(max(p / 100, 0.0), 1.0))
+        # ---- Probability chart ----
+        st.write("#### Class probabilities")
+        probs_df = pd.DataFrame({"Class": CLASS_NAMES, "Probability (%)": probs_np * 100}).set_index("Class")
+        st.bar_chart(probs_df, use_container_width=True)
 
-        st.write("### Recommendation")
+        ranked = sorted(range(len(CLASS_NAMES)), key=lambda i: probs_np[i], reverse=True)
+        cols = st.columns(len(CLASS_NAMES))
+        for i, cls_idx in enumerate(range(len(CLASS_NAMES))):
+            with cols[i]:
+                st.metric(
+                    f"{CLASS_ICONS[cls_idx]} {CLASS_NAMES[cls_idx]}",
+                    f"{probs_np[cls_idx]*100:.1f}%",
+                )
+
+        # ---- Recommendation ----
+        st.write("#### Recommendation")
         if pred == 0:
-            st.success("Result: Healthy — No signs of Diabetic Retinopathy detected.")
+            st.success("Healthy — No signs of Diabetic Retinopathy detected.")
         elif pred == 1:
-            st.warning("Result: Mild DR — Early stage. Please monitor and get periodic checkups.")
+            st.warning("Mild DR — Early stage. Please monitor and get periodic checkups.")
         elif pred == 2:
-            st.warning("Result: Moderate DR — Please consult an ophthalmologist.")
+            st.warning("Moderate DR — Please consult an ophthalmologist.")
         else:
-            st.error("Result: Severe / Proliferative DR — Consult a doctor immediately.")
+            st.error("Severe / Proliferative DR — Consult a doctor immediately.")
 
-        st.write("### 🧠 AI Analysis")
+        if ranked[0] == 1 or (ranked[1] == 1 and (probs_np[ranked[0]] - probs_np[1]) * 100 < 20):
+            st.info(
+                "ℹ️ Mild DR is the hardest class for this model to separate from 'No DR' and "
+                "'Moderate' (it's the rarest, most subtle class in the training data). If this "
+                "case looks borderline, weight the Grad-CAM region and probability spread below "
+                "more heavily than the single top label."
+            )
+
+        # ---- AI Analysis ----
+        st.write("#### 🧠 AI Analysis")
         if gradcam_ok and resized_heatmap is not None:
             st.markdown(generate_ai_explanation(pred, probs_np, resized_heatmap))
         else:
-            st.info("AI analysis requires Grad-CAM output, which failed for this image (see warning above).")
+            st.info("AI analysis requires Grad-CAM output, which failed for this image.")
 
         st.caption(
             "This tool is a screening aid, not a diagnostic device. "
