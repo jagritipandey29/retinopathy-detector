@@ -5,12 +5,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
+import torchvision.models as tv_models
 import streamlit as st
 import gdown
 import requests
 import cv2
 from PIL import Image
-from efficientnet_pytorch import EfficientNet
+from efficientnet_pytorch import EfficientNet as LegacyEfficientNet
 
 # ----------------------------------------------------------------------
 # CONFIG
@@ -19,8 +20,26 @@ MODEL_PATH = "best_model.pth"
 DRIVE_FILE_ID = "1t0FecrXJeVAAqaqpmmpcP72XIhlPpBg4"
 NUM_CLASSES = 5
 CLASS_NAMES = ["No DR", "Mild", "Moderate", "Severe", "Proliferative DR"]
-CANDIDATE_ARCHS = ["efficientnet-b4", "efficientnet-b3", "efficientnet-b0", "efficientnet-b5"]
-MIN_VALID_SIZE_BYTES = 5_000_000  # a real EfficientNet checkpoint is tens of MB
+MIN_VALID_SIZE_BYTES = 5_000_000
+
+# torchvision EfficientNet variants: constructor fn + native training resolution
+TV_VARIANTS = [
+    ("efficientnet_b0", tv_models.efficientnet_b0, 224),
+    ("efficientnet_b1", tv_models.efficientnet_b1, 240),
+    ("efficientnet_b2", tv_models.efficientnet_b2, 260),
+    ("efficientnet_b3", tv_models.efficientnet_b3, 300),
+    ("efficientnet_b4", tv_models.efficientnet_b4, 380),
+    ("efficientnet_b5", tv_models.efficientnet_b5, 456),
+    ("efficientnet_b6", tv_models.efficientnet_b6, 528),
+    ("efficientnet_b7", tv_models.efficientnet_b7, 600),
+]
+# efficientnet-pytorch (lukemelas) variants, kept as a fallback family
+LEGACY_VARIANTS = [
+    ("efficientnet-b0", 224),
+    ("efficientnet-b3", 300),
+    ("efficientnet-b4", 380),
+    ("efficientnet-b5", 456),
+]
 
 CLASS_DESCRIPTIONS = {
     0: "no visible microaneurysms, hemorrhages, or exudates",
@@ -46,30 +65,22 @@ def _looks_like_html(path):
 
 
 def _manual_drive_download(file_id, destination):
-    """Fallback that bypasses gdown entirely using the classic confirm-token
-    dance for large Google Drive files. Works regardless of gdown version."""
     URL = "https://docs.google.com/uc?export=download"
     session = requests.Session()
     response = session.get(URL, params={"id": file_id}, stream=True, timeout=60)
-
     token = None
     for key, value in response.cookies.items():
         if key.startswith("download_warning"):
             token = value
     if token is None:
-        # Newer Drive UI sometimes embeds the confirm token in the HTML body
         for line in response.text.splitlines():
             if "confirm=" in line and "download" in line:
                 start = line.find("confirm=") + len("confirm=")
                 end = line.find("&", start)
                 token = line[start:end if end != -1 else None]
                 break
-
     if token:
-        response = session.get(
-            URL, params={"id": file_id, "confirm": token}, stream=True, timeout=60
-        )
-
+        response = session.get(URL, params={"id": file_id, "confirm": token}, stream=True, timeout=60)
     with open(destination, "wb") as f:
         for chunk in response.iter_content(32768):
             if chunk:
@@ -77,17 +88,16 @@ def _manual_drive_download(file_id, destination):
 
 
 def _try_gdown(file_id, destination):
-    """Call gdown in whatever way its installed version supports."""
     try:
         gdown.download(id=file_id, output=destination, quiet=False, fuzzy=True)
         return
     except TypeError:
-        pass  # installed gdown predates the `fuzzy` kwarg
+        pass
     try:
         gdown.download(id=file_id, output=destination, quiet=False)
         return
     except TypeError:
-        pass  # very old gdown: no `id=` kwarg either
+        pass
     url = f"https://drive.google.com/uc?id={file_id}"
     gdown.download(url, destination, quiet=False)
 
@@ -106,7 +116,6 @@ def download_model():
                 _try_gdown(DRIVE_FILE_ID, MODEL_PATH)
             except Exception:
                 pass
-
             valid = (
                 os.path.exists(MODEL_PATH)
                 and os.path.getsize(MODEL_PATH) >= MIN_VALID_SIZE_BYTES
@@ -124,11 +133,9 @@ def download_model():
     if size < MIN_VALID_SIZE_BYTES or _looks_like_html(MODEL_PATH):
         os.remove(MODEL_PATH)
         raise RuntimeError(
-            f"Downloaded 'best_model.pth' is only {size} bytes and looks like an HTML page, "
-            "not model weights. Google Drive is blocking the automated download for this file. "
-            "Fix: make sure the Drive file is shared as 'Anyone with the link', or download the "
-            ".pth manually and commit it directly into the GitHub repo (Streamlit Cloud will "
-            "then skip the runtime download entirely)."
+            f"Downloaded 'best_model.pth' is only {size} bytes and looks like an HTML page. "
+            "Google Drive is blocking the automated download — share the file as 'Anyone with "
+            "the link', or commit the .pth directly into the GitHub repo instead."
         )
     return size
 
@@ -139,7 +146,6 @@ def download_model():
 def _extract_state_dict(checkpoint):
     if isinstance(checkpoint, nn.Module):
         return None, checkpoint
-
     if isinstance(checkpoint, dict):
         for key in ("state_dict", "model_state_dict", "model_state", "model"):
             if key in checkpoint:
@@ -150,13 +156,22 @@ def _extract_state_dict(checkpoint):
                     return inner, None
         if len(checkpoint) > 0 and all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
             return checkpoint, None
-
     raise ValueError(f"Unrecognized checkpoint format: {type(checkpoint)}")
 
 
+def _remap_se_keys(state_dict):
+    """This checkpoint's squeeze-excitation blocks are named fc1/fc3
+    (fc2 being the parameter-free activation in between), while
+    torchvision's SqueezeExcitation module names them fc1/fc2. Remap so
+    the excite conv lines up with torchvision's second conv layer."""
+    return {k.replace(".fc3.", ".fc2."): v for k, v in state_dict.items()}
+
+
 # ----------------------------------------------------------------------
-# MODEL LOADING — fails loudly instead of silently falling back to
-# random weights (the cause of the earlier uniform-20% bug).
+# MODEL LOADING — tries torchvision EfficientNet variants first (this
+# checkpoint's "features.N.block..." keys match that family), then
+# falls back to the efficientnet-pytorch family. Fails loudly rather
+# than silently keeping random weights.
 # ----------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_model():
@@ -165,13 +180,15 @@ def load_model():
 
     diagnostics = {"checkpoint_type": str(type(checkpoint))}
     if isinstance(checkpoint, dict):
-        diagnostics["checkpoint_keys"] = list(checkpoint.keys())[:20]
+        diagnostics["checkpoint_keys_sample"] = list(checkpoint.keys())[:10]
 
     state_dict, ready_model = _extract_state_dict(checkpoint)
 
     if ready_model is not None:
         ready_model.eval()
-        st.session_state["_detected_arch"] = "loaded as full nn.Module (no arch guessing needed)"
+        st.session_state["_detected_arch"] = "loaded as full nn.Module"
+        st.session_state["_model_family"] = "module"
+        st.session_state["_model_resolution"] = 380
         st.session_state["_load_diagnostics"] = diagnostics
         return ready_model
 
@@ -181,50 +198,85 @@ def load_model():
     state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
     diagnostics["num_state_dict_keys"] = len(state_dict)
 
-    results_per_arch = {}
-    best_arch, best_model, best_missing = None, None, None
+    results = {}
+    best = {"missing": None, "model": None, "family": None, "arch": None, "resolution": None}
 
-    for arch in CANDIDATE_ARCHS:
+    # --- Family 1: torchvision EfficientNet (features.N.block...) ---
+    remapped = _remap_se_keys(state_dict)
+    for arch_name, ctor, resolution in TV_VARIANTS:
         try:
-            candidate = EfficientNet.from_name(arch, num_classes=NUM_CLASSES)
-            missing, unexpected = candidate.load_state_dict(state_dict, strict=False)
-            critical_missing = [k for k in missing if not k.startswith("_fc")]
-            results_per_arch[arch] = {
+            candidate = ctor(weights=None, num_classes=NUM_CLASSES)
+            missing, unexpected = candidate.load_state_dict(remapped, strict=False)
+            critical_missing = [k for k in missing if "classifier" not in k]
+            results[f"torchvision:{arch_name}"] = {
                 "missing": len(missing),
                 "critical_missing": len(critical_missing),
                 "unexpected": len(unexpected),
             }
-            if best_missing is None or len(critical_missing) < best_missing:
-                best_arch, best_model, best_missing = arch, candidate, len(critical_missing)
+            if best["missing"] is None or len(critical_missing) < best["missing"]:
+                best.update(
+                    missing=len(critical_missing),
+                    model=candidate,
+                    family="torchvision",
+                    arch=arch_name,
+                    resolution=resolution,
+                )
         except Exception as e:
-            results_per_arch[arch] = {"error": str(e)}
-            continue
+            results[f"torchvision:{arch_name}"] = {"error": str(e)}
 
-    diagnostics["per_arch_results"] = results_per_arch
+    # --- Family 2: efficientnet-pytorch (legacy) fallback ---
+    for arch_name, resolution in LEGACY_VARIANTS:
+        try:
+            candidate = LegacyEfficientNet.from_name(arch_name, num_classes=NUM_CLASSES)
+            missing, unexpected = candidate.load_state_dict(state_dict, strict=False)
+            critical_missing = [k for k in missing if not k.startswith("_fc")]
+            results[f"legacy:{arch_name}"] = {
+                "missing": len(missing),
+                "critical_missing": len(critical_missing),
+                "unexpected": len(unexpected),
+            }
+            if best["missing"] is None or len(critical_missing) < best["missing"]:
+                best.update(
+                    missing=len(critical_missing),
+                    model=candidate,
+                    family="legacy",
+                    arch=arch_name,
+                    resolution=resolution,
+                )
+        except Exception as e:
+            results[f"legacy:{arch_name}"] = {"error": str(e)}
+
+    diagnostics["per_arch_results"] = results
     st.session_state["_load_diagnostics"] = diagnostics
 
-    total_backbone_keys = len(state_dict)
-    if best_model is None or best_missing is None or best_missing > max(5, 0.02 * total_backbone_keys):
+    total_keys = len(state_dict)
+    if best["model"] is None or best["missing"] is None or best["missing"] > max(5, 0.02 * total_keys):
         raise RuntimeError(
-            "Could not confidently match the checkpoint to any known EfficientNet "
-            f"architecture — best candidate ('{best_arch}') still had {best_missing} "
-            f"unmatched backbone keys. Details: {results_per_arch}"
+            "Could not confidently match the checkpoint to any known EfficientNet variant "
+            f"(torchvision or efficientnet-pytorch) — best candidate "
+            f"'{best['family']}:{best['arch']}' still had {best['missing']} unmatched keys. "
+            f"See diagnostics below. Details: {results}"
         )
 
-    best_model.eval()
-    st.session_state["_detected_arch"] = f"{best_arch} (missing critical keys: {best_missing})"
-    return best_model
+    best["model"].eval()
+    st.session_state["_detected_arch"] = f"{best['family']}:{best['arch']} (missing critical keys: {best['missing']})"
+    st.session_state["_model_family"] = best["family"]
+    st.session_state["_model_resolution"] = best["resolution"]
+    return best["model"]
 
 
 # ----------------------------------------------------------------------
-# PREPROCESSING
+# PREPROCESSING — resolution depends on which variant matched, but the
+# resize+centercrop ratio still protects against WhatsApp/screenshot
+# black-border images the way the fixed 256/224 pipeline did.
 # ----------------------------------------------------------------------
-def preprocess_image(pil_image):
+def preprocess_image(pil_image, resolution):
     pil_image = pil_image.convert("RGB")
+    resize_dim = int(round(resolution * 256 / 224))
     transform = transforms.Compose(
         [
-            transforms.Resize((256, 256)),
-            transforms.CenterCrop(224),
+            transforms.Resize((resize_dim, resize_dim)),
+            transforms.CenterCrop(resolution),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]
@@ -276,15 +328,24 @@ class GradCAM:
         self.bwd_handle.remove()
 
 
-def get_target_layer(model):
-    if hasattr(model, "_conv_head"):
-        return model._conv_head
-    return model._blocks[-1]
+def get_target_layer(model, family):
+    if family == "torchvision":
+        return model.features[-1]
+    if family == "legacy":
+        if hasattr(model, "_conv_head"):
+            return model._conv_head
+        return model._blocks[-1]
+    # unknown / plain nn.Module fallback: use the last child module with parameters
+    last = None
+    for m in model.modules():
+        if isinstance(m, (nn.Conv2d,)):
+            last = m
+    return last
 
 
-def overlay_gradcam(pil_image_224, cam):
-    img = np.array(pil_image_224.resize((224, 224))).astype(np.float32) / 255.0
-    heatmap = cv2.resize(cam, (224, 224))
+def overlay_gradcam(pil_image, cam, resolution):
+    img = np.array(pil_image.resize((resolution, resolution))).astype(np.float32) / 255.0
+    heatmap = cv2.resize(cam, (resolution, resolution))
     heatmap_u8 = np.uint8(255 * heatmap)
     heatmap_color = cv2.applyColorMap(heatmap_u8, cv2.COLORMAP_JET)
     heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
@@ -297,7 +358,6 @@ def overlay_gradcam(pil_image_224, cam):
 # AI-STYLE ANALYSIS REPORT
 # ----------------------------------------------------------------------
 def describe_attention_region(heatmap):
-    """Summarize WHERE the model focused, from the Grad-CAM heatmap."""
     h, w = heatmap.shape
     yy, xx = np.mgrid[0:h, 0:w]
     total = heatmap.sum()
@@ -306,7 +366,6 @@ def describe_attention_region(heatmap):
 
     cy = (yy * heatmap).sum() / total
     cx = (xx * heatmap).sum() / total
-
     vert = "upper" if cy < h / 3 else ("lower" if cy > 2 * h / 3 else "central")
     horiz = "left" if cx < w / 3 else ("right" if cx > 2 * w / 3 else "central")
 
@@ -326,40 +385,34 @@ def describe_attention_region(heatmap):
 def generate_ai_explanation(pred, probs_np, heatmap):
     region, hot_frac = describe_attention_region(heatmap)
     conf = probs_np[pred] * 100
-
     ranked = sorted(range(len(CLASS_NAMES)), key=lambda i: probs_np[i], reverse=True)
     runner_up = ranked[1]
     runner_gap = (probs_np[ranked[0]] - probs_np[runner_up]) * 100
 
-    lines = []
-    lines.append(
+    lines = [
         f"**Prediction summary:** The model identified this fundus image as **{CLASS_NAMES[pred]}** "
-        f"with **{conf:.1f}%** confidence."
-    )
-    lines.append(
+        f"with **{conf:.1f}%** confidence.",
         f"**Typical findings at this stage:** {CLASS_NAMES[pred]} is usually characterized by "
-        f"{CLASS_DESCRIPTIONS[pred]}."
-    )
+        f"{CLASS_DESCRIPTIONS[pred]}.",
+    ]
 
     if hot_frac > 0.5:
         lines.append(
-            f"**Where the model looked:** Grad-CAM shows the model's attention was concentrated "
-            f"mainly in the **{region}** of the retina (roughly {hot_frac:.0f}% of the image area "
-            f"showed strong activation). This is the region driving the prediction — worth comparing "
-            f"against that area of the original image for hemorrhages, exudates, or vessel abnormalities."
+            f"**Where the model looked:** Grad-CAM shows attention concentrated mainly in the "
+            f"**{region}** of the retina (~{hot_frac:.0f}% of the image showed strong activation). "
+            "Compare that region of the original image for hemorrhages, exudates, or vessel abnormalities."
         )
     else:
         lines.append(
-            "**Where the model looked:** Attention was fairly diffuse across the retina rather than "
-            "sharply localized, which is typical for 'No DR' or very early/subtle findings."
+            "**Where the model looked:** Attention was fairly diffuse rather than sharply "
+            "localized, typical for 'No DR' or very early/subtle findings."
         )
 
     if runner_gap < 15:
         lines.append(
             f"**Borderline case:** The second-most-likely class, **{CLASS_NAMES[runner_up]}** "
             f"({probs_np[runner_up]*100:.1f}%), is close to the top prediction (gap: {runner_gap:.1f} "
-            "points). Treat this case as borderline and prioritize clinical correlation rather than "
-            "relying on the label alone."
+            "points). Treat this as borderline and prioritize clinical correlation."
         )
     else:
         lines.append(
@@ -393,8 +446,10 @@ except Exception as e:
             st.json(diag)
     st.stop()
 
+model_family = st.session_state.get("_model_family", "torchvision")
+resolution = st.session_state.get("_model_resolution", 380)
 detected_arch = st.session_state.get("_detected_arch", "unknown")
-st.caption(f"Backbone detected: `{detected_arch}`")
+st.caption(f"Backbone detected: `{detected_arch}` · input resolution: {resolution}px")
 with st.expander("Model load diagnostics"):
     st.json(st.session_state.get("_load_diagnostics", {}))
 
@@ -404,7 +459,7 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file is not None:
     raw_image = Image.open(io.BytesIO(uploaded_file.read()))
-    display_image, input_tensor = preprocess_image(raw_image)
+    display_image, input_tensor = preprocess_image(raw_image, resolution)
 
     if st.button("Predict", type="primary"):
         with st.spinner("Running inference..."):
@@ -414,18 +469,21 @@ if uploaded_file is not None:
                 pred = int(torch.argmax(probs).item())
                 conf = float(probs[pred].item()) * 100
 
-            target_layer = get_target_layer(model)
-            cam_extractor = GradCAM(model, target_layer)
-            try:
-                cam = cam_extractor.generate(input_tensor, pred)
-                overlay, resized_heatmap = overlay_gradcam(display_image, cam)
-                gradcam_ok = True
-            except Exception as e:
-                gradcam_ok = False
-                gradcam_error = str(e)
-                resized_heatmap = None
-            finally:
-                cam_extractor.remove_hooks()
+            target_layer = get_target_layer(model, model_family)
+            gradcam_ok = False
+            resized_heatmap = None
+            if target_layer is not None:
+                cam_extractor = GradCAM(model, target_layer)
+                try:
+                    cam = cam_extractor.generate(input_tensor, pred)
+                    overlay, resized_heatmap = overlay_gradcam(display_image, cam, resolution)
+                    gradcam_ok = True
+                except Exception as e:
+                    gradcam_error = str(e)
+                finally:
+                    cam_extractor.remove_hooks()
+            else:
+                gradcam_error = "No suitable target layer found for Grad-CAM on this model."
 
         probs_np = probs.detach().numpy()
         if probs_np.std() < 0.02:
