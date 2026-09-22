@@ -189,10 +189,20 @@ def _remap_se_keys(state_dict):
 
 
 # ----------------------------------------------------------------------
-# MODEL LOADING — tries efficientnet-pytorch (legacy, "_blocks"/"_fc"
-# naming — this is what the confirmed-working baseline used) FIRST,
-# then torchvision variants ("features.N.block..." naming) as fallback,
-# since the live checkpoint on Drive has swapped format before.
+# MODEL LOADING
+#
+# IMPORTANT: this function is wrapped in @st.cache_resource, which is a
+# PROCESS-WIDE cache shared across every user session — not per-session
+# like st.session_state. Its body only runs on the very first call after
+# a deploy/restart; every later call (including from brand-new sessions)
+# just returns the cached value WITHOUT re-executing this function.
+#
+# That means anything the model's *identity* depends on (which family it
+# is, which target layer Grad-CAM needs, what resolution to preprocess
+# at) MUST be returned as part of the cached value itself. Writing it to
+# st.session_state instead is a bug: a new session would read its own
+# empty/default session_state while silently getting the OTHER family's
+# cached model object, causing exactly the AttributeError seen before.
 # ----------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_model():
@@ -207,11 +217,13 @@ def load_model():
 
     if ready_model is not None:
         ready_model.eval()
-        st.session_state["_detected_arch"] = "loaded as full nn.Module"
-        st.session_state["_model_family"] = "module"
-        st.session_state["_model_resolution"] = 380
-        st.session_state["_load_diagnostics"] = diagnostics
-        return ready_model
+        return {
+            "model": ready_model,
+            "family": "module",
+            "arch": "full nn.Module (no arch guessing needed)",
+            "resolution": 380,
+            "diagnostics": diagnostics,
+        }
 
     if state_dict is None or len(state_dict) == 0:
         raise RuntimeError(f"Checkpoint parsed but contained no weights. Diagnostics: {diagnostics}")
@@ -258,7 +270,6 @@ def load_model():
             results[f"torchvision:{arch_name}"] = {"error": str(e)}
 
     diagnostics["per_arch_results"] = results
-    st.session_state["_load_diagnostics"] = diagnostics
 
     total_keys = len(state_dict)
     if best["model"] is None or best["missing"] is None or best["missing"] > max(5, 0.02 * total_keys):
@@ -269,10 +280,13 @@ def load_model():
         )
 
     best["model"].eval()
-    st.session_state["_detected_arch"] = f"{best['family']}:{best['arch']} (missing critical keys: {best['missing']})"
-    st.session_state["_model_family"] = best["family"]
-    st.session_state["_model_resolution"] = best["resolution"]
-    return best["model"]
+    return {
+        "model": best["model"],
+        "family": best["family"],
+        "arch": f"{best['family']}:{best['arch']} (missing critical keys: {best['missing']})",
+        "resolution": best["resolution"],
+        "diagnostics": diagnostics,
+    }
 
 
 # ----------------------------------------------------------------------
@@ -295,11 +309,6 @@ def preprocess_image(pil_image, resolution):
 
 # ----------------------------------------------------------------------
 # TEST-TIME AUGMENTATION
-# A genuine, retrain-free way to nudge recall on a hard, easily-confused
-# minority class like Mild DR: average predictions across a few simple
-# augmented views instead of trusting a single crop/orientation.
-# This will not fix a class the model never learned well, but it does
-# reduce single-view noise that pushes borderline Mild cases the wrong way.
 # ----------------------------------------------------------------------
 def predict_with_tta(model, base_tensor):
     views = [base_tensor, torch.flip(base_tensor, dims=[3])]  # original + horizontal flip
@@ -356,18 +365,23 @@ class GradCAM:
         self.bwd_handle.remove()
 
 
-def get_target_layer(model, family):
-    if family == "torchvision":
-        return model.features[-1]
-    if family == "legacy":
-        if hasattr(model, "_conv_head"):
-            return model._conv_head
+def get_target_layer(model):
+    """Robust, self-contained detection — does NOT rely on any external
+    'which family is this' bookkeeping, so it can't go stale across
+    sessions or cache hits. Just inspects the actual model object."""
+    if hasattr(model, "_conv_head"):          # efficientnet-pytorch
+        return model._conv_head
+    if hasattr(model, "_blocks"):             # efficientnet-pytorch (older)
         return model._blocks[-1]
-    last = None
+    if hasattr(model, "features"):            # torchvision EfficientNet / others
+        return model.features[-1]
+    if hasattr(model, "layer4"):              # resnet-style
+        return model.layer4[-1]
+    last_conv = None
     for m in model.modules():
         if isinstance(m, nn.Conv2d):
-            last = m
-    return last
+            last_conv = m
+    return last_conv
 
 
 def overlay_gradcam(pil_image, cam, resolution):
@@ -460,21 +474,17 @@ st.caption("EfficientNet-based classifier trained on the APTOS 2019 dataset, wit
 
 try:
     with st.spinner("Loading model..."):
-        model = load_model()
+        bundle = load_model()
 except Exception as e:
     st.error(f"Failed to load model: {e}")
-    diag = st.session_state.get("_load_diagnostics")
-    if diag:
-        with st.expander("Debug details"):
-            st.json(diag)
     st.stop()
 
-model_family = st.session_state.get("_model_family", "legacy")
-resolution = st.session_state.get("_model_resolution", 380)
-detected_arch = st.session_state.get("_detected_arch", "unknown")
+model = bundle["model"]
+resolution = bundle["resolution"]
+detected_arch = bundle["arch"]
 
 with st.expander(f"⚙️ Backbone: `{detected_arch}` · input {resolution}px — diagnostics"):
-    st.json(st.session_state.get("_load_diagnostics", {}))
+    st.json(bundle["diagnostics"])
 
 uploaded_file = st.file_uploader("Retina image upload karo", type=["jpg", "jpeg", "png", "bmp", "webp"])
 
@@ -493,7 +503,7 @@ if uploaded_file is not None:
             conf = float(probs[pred].item()) * 100
             probs_np = probs.detach().numpy()
 
-            target_layer = get_target_layer(model, model_family)
+            target_layer = get_target_layer(model)
             gradcam_ok = False
             resized_heatmap = None
             overlay = None
@@ -528,8 +538,7 @@ if uploaded_file is not None:
             f"""
             <div class="result-card" style="border-left: 5px solid {color};">
                 <span class="badge" style="background:{color};">{CLASS_ICONS[pred]} {CLASS_NAMES[pred]}</span>
-                <div class="conf-sub">Model confidence: <b>{conf:.2f}%</b>
-                {" (TTA-averaged over original + flipped view)" if True else ""}</div>
+                <div class="conf-sub">Model confidence: <b>{conf:.2f}%</b> (TTA-averaged over original + flipped view)</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -542,12 +551,9 @@ if uploaded_file is not None:
 
         ranked = sorted(range(len(CLASS_NAMES)), key=lambda i: probs_np[i], reverse=True)
         cols = st.columns(len(CLASS_NAMES))
-        for i, cls_idx in enumerate(range(len(CLASS_NAMES))):
+        for i in range(len(CLASS_NAMES)):
             with cols[i]:
-                st.metric(
-                    f"{CLASS_ICONS[cls_idx]} {CLASS_NAMES[cls_idx]}",
-                    f"{probs_np[cls_idx]*100:.1f}%",
-                )
+                st.metric(f"{CLASS_ICONS[i]} {CLASS_NAMES[i]}", f"{probs_np[i]*100:.1f}%")
 
         # ---- Recommendation ----
         st.write("#### Recommendation")
