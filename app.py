@@ -1,211 +1,232 @@
-"""
-Diabetic Retinopathy Screening App
-"""
-import os
-import numpy as np
-import cv2
+import streamlit as st
 import torch
 import torch.nn as nn
-from torchvision import models
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-import streamlit as st
+import torch.nn.functional as F
+from torchvision import models, transforms
 from PIL import Image
-import plotly.graph_objects as go
+import cv2
+import numpy as np
+import os
 import gdown
+import plotly.express as px
+import plotly.graph_objects as go
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.image import show_cam_on_image
 
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "best_qwk_final.pth")
-GDRIVE_FILE_ID = "1f4mtlffwi9omaJKERX-KRY4hrk86B5Uz"
-IMG_SIZE = 380
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-CLASS_NAMES = {0: "No DR",1: "Mild",2: "Moderate",3: "Severe",4: "Proliferative DR"}
-CLASS_COLORS = {0: "#2ecc71",1: "#a3d977",2: "#f5c518",3: "#f39c12",4: "#e74c3c"}
-REFERABLE_CLASSES = {2, 3, 4}
-
-st.set_page_config(page_title="DR Screening", page_icon="🩺", layout="wide")
-
-st.markdown(
-    """
-    <style>
-   .block-container { padding-top: 2rem; }
-   .badge-yes {
-        background: linear-gradient(135deg, #ff6b6b 0%, #c0392b 100%);
-        border-radius: 16px; padding: 28px; text-align: center; color: white;
-    }
-   .badge-no {
-        background: linear-gradient(135deg, #2ecc71 0%, #1a7d3a 100%);
-        border-radius: 16px; padding: 28px; text-align: center; color: white;
-    }
-   .badge-yes h1,.badge-no h1 { margin: 0; font-size: 2rem; }
-   .badge-yes p,.badge-no p { margin: 4px 0 0 0; opacity: 0.95; }
-    </style>
-    """,
-    unsafe_allow_html=True,
+# --- PAGE CONFIGURATION ---
+st.set_page_config(
+    page_title="RetinaAI - DR Screening System",
+    page_icon="🩺",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-def ensure_model_downloaded():
-    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 5000000:
-        return True
-    if os.path.exists(MODEL_PATH):
-        os.remove(MODEL_PATH)
-    try:
-        with st.spinner("Downloading model weights (first run only, ~75MB)..."):
-            url = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
-            gdown.download(url, MODEL_PATH, quiet=False)
-        return os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 5000000
-    except Exception as e:
-        st.error(f"Model download failed: {e}")
-        return False
+# --- CUSTOM CSS FOR CLINICAL DASHBOARD STYLING ---
+st.markdown("""
+    <style>
+    .main { background-color: #0e1117; }
+    .stMetric {
+        background: #1e222d;
+        padding: 15px;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+    }
+    .status-card-danger {
+        background-color: #3b181a;
+        border-left: 6px solid #ff4b4b;
+        padding: 15px;
+        border-radius: 8px;
+        color: #ff8888;
+        font-weight: bold;
+    }
+    .status-card-success {
+        background-color: #12331c;
+        border-left: 6px solid #00c853;
+        padding: 15px;
+        border-radius: 8px;
+        color: #81c784;
+        font-weight: bold;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# --- MODEL LOADING WITH CACHE ---
+MODEL_ID = "1f4mtlffwi9omaJKERX-KRY4hrk86B5Uz"
+MODEL_PATH = "best_qwk_final.pth"
 
 @st.cache_resource
-def load_model():
-    if not ensure_model_downloaded():
-        return None
+def load_dr_model():
+    if not os.path.exists(MODEL_PATH):
+        gdown.download(f"https://drive.google.com/uc?id={MODEL_ID}", MODEL_PATH, quiet=False)
     model = models.efficientnet_b4(weights=None)
     model.classifier[1] = nn.Linear(model.classifier[1].in_features, 5)
-    state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
-    model.load_state_dict(state_dict)
-    model.to(DEVICE)
+    model.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
     model.eval()
     return model
 
-def preprocess(pil_img: Image.Image):
-    img = np.array(pil_img.convert("RGB"))
-    tf = A.Compose([A.Resize(IMG_SIZE, IMG_SIZE), A.Normalize(), ToTensorV2()])
-    tensor = tf(image=img)["image"]
-    return tensor.unsqueeze(0), cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+model = load_dr_model()
 
-@torch.no_grad()
-def predict(model, tensor):
-    logits = model(tensor.to(DEVICE))
-    probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
-    pred_class = int(np.argmax(probs))
-    referable_prob = float(sum(probs[c] for c in REFERABLE_CLASSES))
-    is_referable = pred_class in REFERABLE_CLASSES
-    return pred_class, probs, is_referable, referable_prob
+# --- HELPER FUNCTIONS ---
+def process_quality_and_clahe(img_np):
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+    brightness = np.mean(gray)
+    
+    if blur_score < 50 or brightness < 15 or brightness > 235:
+        return None, False, f"Image quality too low (Blur Score: {blur_score:.1f}). Please re-capture."
+    
+    denoised = cv2.fastNlMeansDenoisingColored(img_np, None, 5, 5, 7, 21)
+    green = denoised[:, :, 1]
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    enhanced_green = clahe.apply(green)
+    
+    enhanced_img = denoised.copy()
+    enhanced_img[:, :, 1] = enhanced_green
+    return enhanced_img, True, "Quality Check Passed & CLAHE Enhancement Applied."
 
-class GradCAM:
-    def __init__(self, model, target_layer):
-        self.model = model
-        self.gradients = None
-        self.activations = None
-        target_layer.register_forward_hook(self._save_activation)
-        target_layer.register_full_backward_hook(self._save_gradient)
-    def _save_activation(self, module, inp, out):
-        self.activations = out.detach()
-    def _save_gradient(self, module, grad_in, grad_out):
-        self.gradients = grad_out[0].detach()
-    def generate(self, input_tensor, class_idx):
-        input_tensor = input_tensor.to(DEVICE)
-        input_tensor.requires_grad_(True)
-        output = self.model(input_tensor)
-        self.model.zero_grad()
-        output[0, class_idx].backward()
-        pooled_grads = torch.mean(self.gradients, dim=[0, 2, 3])
-        activations = self.activations[0].clone()
-        for i in range(activations.shape[0]):
-            activations[i] *= pooled_grads[i]
-        heatmap = torch.mean(activations, dim=0).cpu().numpy()
-        heatmap = np.maximum(heatmap, 0)
-        heatmap = heatmap / (heatmap.max() + 1e-8)
-        return heatmap
+def segment_lesions(img_np):
+    green = img_np[:, :, 1]
+    kernel_v = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    top_v = cv2.morphologyEx(green, cv2.MORPH_TOPHAT, kernel_v)
+    _, vessels = cv2.threshold(top_v, 15, 255, cv2.THRESH_BINARY)
+    
+    kernel_m = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    top_m = cv2.morphologyEx(green, cv2.MORPH_TOPHAT, kernel_m)
+    _, ma = cv2.threshold(top_m, 20, 255, cv2.THRESH_BINARY)
+    ma = cv2.bitwise_and(ma, cv2.bitwise_not(vessels))
+    return vessels, ma
 
-def overlay_heatmap(base_img_rgb, heatmap, alpha=0.45):
-    heatmap_resized = cv2.resize(heatmap, (base_img_rgb.shape[1], base_img_rgb.shape[0]))
-    heatmap_uint8 = np.uint8(255 * heatmap_resized)
-    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
-    heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
-    overlay = cv2.addWeighted(base_img_rgb, 1 - alpha, heatmap_color, alpha, 0)
-    return overlay
+def generate_gradcam(model, img_tensor, img_np_resized):
+    target_layers = [model.conv_head]
+    cam = GradCAM(model=model, target_layers=target_layers)
+    grayscale_cam = cam(input_tensor=img_tensor)[0, :]
+    rgb_float = img_np_resized.astype(np.float32) / 255.0
+    return show_cam_on_image(rgb_float, grayscale_cam, use_rgb=True)
 
-@st.cache_resource
-def get_gradcam(_model):
-    target_layer = _model.features[-1]
-    return GradCAM(_model, target_layer)
+# --- SIDEBAR: CLINICAL CONTROLS & PATIENT INFO ---
+st.sidebar.title("🩺 Patient Details")
+patient_id = st.sidebar.text_input("Patient ID", "PT-88392")
+patient_age = st.sidebar.number_input("Age", 18, 100, 54)
+eye_side = st.sidebar.selectbox("Eye Side", ["Right Eye (OD)", "Left Eye (OS)"])
 
-# FIXED: White box hataya, title clean kiya taaki button ke piche na aaye
-def build_probability_bar(probs):
-    labels = [CLASS_NAMES[c] for c in range(5)]
-    values = [probs[c] * 100 for c in range(5)]
-    colors = [CLASS_COLORS[c] for c in range(5)]
-    fig = go.Figure(go.Bar(x=values, y=labels, orientation="h", marker=dict(color=colors), text=[f"{v:.1f}%" for v in values], textposition="outside"))
-    fig.update_layout(
-        title="Stage-wise confidence",
-        xaxis_title="Probability (%)",
-        xaxis=dict(range=[0, 100]),
-        height=320,
-        margin=dict(l=10, r=30, t=40, b=10),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="white"),
-    )
-    return fig
+st.sidebar.markdown("---")
+st.sidebar.caption("🔒 Model: EfficientNet-B4 (Trained with QWK Loss)")
 
-def build_confidence_donut(referable_prob, is_referable):
-    non_ref = 100 - referable_prob * 100
-    ref = referable_prob * 100
-    colors = ["#e74c3c", "#2ecc71"]
-    fig = go.Figure(go.Pie(labels=["Referable", "Non-referable"], values=[ref, non_ref], hole=0.65, marker=dict(colors=colors), textinfo="percent", sort=False))
-    fig.update_layout(
-        title="Referable vs Non-referable",
-        height=320,
-        margin=dict(l=10, r=10, t=40, b=10),
-        paper_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="white"),
-        showlegend=True,
-    )
-    return fig
+# --- MAIN HEADER ---
+st.title("👁️ Retinal Diabetic Retinopathy Screening System")
+st.write("Automated AI Diagnostics, Lesion Segmentation & Explainability Visuals")
 
-st.title("🩺 Diabetic Retinopathy Screening")
-st.caption("Research/screening-support tool — not a diagnostic device. Always confirm with an eye-care professional.")
+uploaded_file = st.file_uploader("Upload Retinal Fundus Scan Image", type=["jpg", "png", "jpeg"])
 
-model = load_model()
-if model is None:
-    st.error("Could not load model weights. Check Drive link is 'Anyone with the link'")
-    st.stop()
+if uploaded_file is not None:
+    raw_img = Image.open(uploaded_file).convert("RGB")
+    raw_np = np.array(raw_img)
+    
+    enhanced_np, is_pass, quality_msg = process_quality_and_clahe(raw_np)
+    
+    if is_pass:
+        img_resized = cv2.resize(enhanced_np, (380, 380))
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        img_tensor = transform(img_resized).unsqueeze(0)
+        
+        with torch.no_grad():
+            outputs = model(img_tensor)
+            probs = F.softmax(outputs, dim=1).numpy()[0]
+            pred_class = int(np.argmax(probs))
+            conf = float(probs[pred_class] * 100)
+            
+        labels = [
+            "No DR (Normal)",
+            "Mild DR",
+            "Moderate DR",
+            "Severe DR",
+            "Proliferative DR"
+        ]
+        
+        is_referable = pred_class >= 2
+        
+        # --- HEADER KPI METRICS ---
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        col_m1.metric("Predicted Diagnosis", labels[pred_class])
+        col_m2.metric("Confidence Score", f"{conf:.1f}%")
+        col_m3.metric("Referable DR Status", "YES" if is_referable else "NO")
+        col_m4.metric("Image Quality Check", "Passed (CLAHE)")
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        # --- ALERT BANNER ---
+        if is_referable:
+            st.markdown(f'<div class="status-card-danger">⚠️ REFERABLE DR DETECTED: High likelihood of Diabetic Retinopathy ({labels[pred_class]}). Immediate Ophthalmologist referral recommended.</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="status-card-success">✅ NO REFERABLE DR: Scan indicates low risk ({labels[pred_class]}). Routine annual follow-up recommended.</div>', unsafe_allow_html=True)
+            
+        st.markdown("<br>", unsafe_allow_html=True)
 
-uploaded = st.file_uploader("Upload a retinal fundus image", type=["jpg", "jpeg", "png"])
+        # --- TABS FOR ORGANIZED PRESENTATION ---
+        tab1, tab2, tab3, tab4 = st.tabs([
+            "📊 Diagnosis & Probabilities",
+            "🔍 Structural Lesion Masking",
+            "🧠 AI Grad-CAM Heatmap",
+            "📈 Telemedicine Load Simulator"
+        ])
+        
+        # TAB 1: DIAGNOSIS & PLOTLY CHARTS
+        with tab1:
+            col_img, col_chart = st.columns([1, 1])
+            with col_img:
+                st.subheader("Enhanced Fundus Image")
+                st.image(enhanced_np, use_container_width=True, caption=f"Patient: {patient_id} ({eye_side})")
+                
+            with col_chart:
+                st.subheader("Stage-wise Probability Distribution")
+                
+                # Plotly Horizontal Bar Chart
+                fig_bar = px.bar(
+                    x=probs * 100,
+                    y=labels,
+                    orientation='h',
+                    labels={'x': 'Probability (%)', 'y': 'DR Severity Stage'},
+                    color=probs * 100,
+                    color_continuous_scale='Reds' if is_referable else 'Greens'
+                )
+                fig_bar.update_layout(showlegend=False, height=350, margin=dict(l=20, r=20, t=30, b=20))
+                st.plotly_chart(fig_bar, use_container_width=True)
 
-if uploaded:
-    pil_image = Image.open(uploaded)
-    tensor, resized_rgb = preprocess(pil_image)
+        # TAB 2: LESION SEGMENTATION
+        with tab2:
+            st.subheader("Extracted Vascular & Lesion Features")
+            vessels, microaneurysms = segment_lesions(img_resized)
+            
+            c_v1, c_v2, c_v3 = st.columns(3)
+            c_v1.image(img_resized, caption="Original Fundus", use_container_width=True)
+            c_v2.image(vessels, caption="Vessel Structure Mask", use_container_width=True)
+            c_v3.image(microaneurysms, caption="Detected Microaneurysms", use_container_width=True)
 
-    with st.spinner("Analyzing image..."):
-        pred_class, probs, is_referable, referable_prob = predict(model, tensor)
-        gradcam = get_gradcam(model)
-        heatmap = gradcam.generate(tensor.clone(), pred_class)
-        overlay_img = overlay_heatmap(resized_rgb, heatmap)
+        # TAB 3: GRAD-CAM HEATMAP
+        with tab3:
+            st.subheader("Model Attention Region (Grad-CAM)")
+            gradcam_result = generate_gradcam(model, img_tensor, img_resized)
+            
+            c_g1, c_g2 = st.columns(2)
+            c_g1.image(img_resized, caption="Preprocessed Image", use_container_width=True)
+            c_g2.image(gradcam_result, caption="AI Focus / Heatmap Highlights", use_container_width=True)
 
-    if is_referable:
-        st.markdown(f"""<div class="badge-yes"><h1>⚠️ Referable DR: YES</h1><p>Refer to an ophthalmologist — confidence {referable_prob*100:.1f}%</p></div>""", unsafe_allow_html=True)
+        # TAB 4: TELEMEDICINE SIMULATOR
+        with tab4:
+            st.subheader("Telemedicine Clinic Program Simulation")
+            annual_p = st.slider("Target Annual Patient Volume", 10000, 200000, 50000, step=10000)
+            
+            daily_scans = int(annual_p / 365)
+            referral_cases = int(daily_scans * 0.18)
+            doc_hours = (referral_cases * 3) / 60
+            
+            sim_col1, sim_col2, sim_col3 = st.columns(3)
+            sim_col1.metric("Daily Patient Scans", f"{daily_scans} / day")
+            sim_col2.metric("Expected Referral Cases", f"{referral_cases} / day")
+            sim_col3.metric("Doctor Review Time", f"{doc_hours:.1f} Hours / day")
+            
     else:
-        st.markdown(f"""<div class="badge-no"><h1>✅ Referable DR: NO</h1><p>Routine monitoring — confidence {(1-referable_prob)*100:.1f}%</p></div>""", unsafe_allow_html=True)
-
-    st.write("")
-    tab_result, tab_attention = st.tabs(["📊 Result & Charts", "🔍 AI Attention Map"])
-
-    with tab_result:
-        col_img, col_charts = st.columns([1, 1.3])
-        with col_img:
-            st.image(pil_image, caption="Uploaded fundus image", width='stretch')
-            st.metric("Predicted grade", CLASS_NAMES[pred_class], f"{probs[pred_class]*100:.1f}%")
-        with col_charts:
-            st.plotly_chart(build_probability_bar(probs), width='stretch')
-            st.plotly_chart(build_confidence_donut(referable_prob, is_referable), width='stretch')
-
-    with tab_attention:
-        st.write("Grad-CAM shows which regions influenced the prediction — red/yellow = high influence")
-        alpha = st.slider("Heatmap intensity", 0.0, 0.9, 0.45, 0.05)
-        overlay_display = overlay_heatmap(resized_rgb, heatmap, alpha=alpha)
-        c1, c2 = st.columns(2)
-        with c1:
-            st.image(resized_rgb, caption="Original (preprocessed)", width='stretch')
-        with c2:
-            st.image(overlay_display, caption="AI attention map", width='stretch')
-
-    with st.expander("Raw probability table"):
-        for c in range(5):
-            st.write(f"**{CLASS_NAMES[c]}**: {probs[c]*100:.2f}%")
-else:
-    st.info("Upload a fundus image to get prediction, charts, and attention map.")
+        st.error(quality_msg)
