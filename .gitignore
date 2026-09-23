@@ -1,0 +1,18 @@
+# Model weights (auto-downloaded at runtime from Google Drive, don't commit)
+best_qwk_final.pth
+*.pth
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
