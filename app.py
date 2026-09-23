@@ -97,7 +97,8 @@ def segment_lesions(img_np):
     return vessels, ma
 
 def generate_gradcam(model, img_tensor, img_np_resized):
-    target_layers = [model.conv_head]
+    # Fixed target layer for EfficientNet-B4
+    target_layers = [model.features[-1]]
     cam = GradCAM(model=model, target_layers=target_layers)
     grayscale_cam = cam(input_tensor=img_tensor)[0, :]
     rgb_float = img_np_resized.astype(np.float32) / 255.0
