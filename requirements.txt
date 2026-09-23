@@ -5,5 +5,5 @@ opencv-python-headless
 pillow
 numpy
 gdown
-pytorch-grad-cam
+grad-cam
 plotly
