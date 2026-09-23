@@ -1,15 +1,9 @@
 """
 Diabetic Retinopathy Screening App
------------------------------------
+
 Model: EfficientNet-B4 (5-class DR grading), QWK-selected checkpoint.
-Headline: Referable DR (Yes/No)  |  Charts: stage-probability + confidence donut
-Explainability: Grad-CAM "AI attention map" showing which retinal regions drove the prediction.
-
-Run:
-    pip install -r requirements.txt
-    streamlit run app.py
-
-Model weights auto-download from Google Drive on first run (see GDRIVE_FILE_ID).
+Headline: Referable DR (Yes/No) | Charts: stage-probability + confidence donut
+Explainability: Grad-CAM "AI attention map"
 """
 
 import os
@@ -57,20 +51,20 @@ st.set_page_config(page_title="DR Screening", page_icon="🩺", layout="wide")
 st.markdown(
     """
     <style>
-    .block-container { padding-top: 2rem; }
-    .badge-yes {
+   .block-container { padding-top: 2rem; }
+   .badge-yes {
         background: linear-gradient(135deg, #ff6b6b 0%, #c0392b 100%);
         border-radius: 16px; padding: 28px; text-align: center; color: white;
         box-shadow: 0 8px 24px rgba(192,57,43,0.35);
     }
-    .badge-no {
+   .badge-no {
         background: linear-gradient(135deg, #2ecc71 0%, #1a7d3a 100%);
         border-radius: 16px; padding: 28px; text-align: center; color: white;
         box-shadow: 0 8px 24px rgba(26,125,58,0.35);
     }
-    .badge-yes h1, .badge-no h1 { margin: 0; font-size: 2rem; }
-    .badge-yes p, .badge-no p { margin: 4px 0 0 0; opacity: 0.95; }
-    .info-card {
+   .badge-yes h1,.badge-no h1 { margin: 0; font-size: 2rem; }
+   .badge-yes p,.badge-no p { margin: 4px 0 0 0; opacity: 0.95; }
+   .info-card {
         background: #f8f9fb; border-radius: 12px; padding: 16px 20px;
         border: 1px solid #eaeaea; margin-top: 12px;
     }
@@ -80,22 +74,24 @@ st.markdown(
 )
 
 # --------------------------------------------------------------------------
-# Model loading
+# Model loading - FIXED for Streamlit Cloud
 # --------------------------------------------------------------------------
 def ensure_model_downloaded():
-    if os.path.exists(MODEL_PATH):
+    # Agar file hai aur size 5MB se bada hai to sahi hai
+    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 5000000:
         return True
+    if os.path.exists(MODEL_PATH):
+        os.remove(MODEL_PATH)
     if not GDRIVE_FILE_ID:
         return False
     try:
-        with st.spinner("Downloading model weights (first run only, ~70-80MB)..."):
+        with st.spinner("Downloading model weights (first run only, ~75MB)..."):
             url = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
             gdown.download(url, MODEL_PATH, quiet=False)
-        return os.path.exists(MODEL_PATH)
+        return os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 5000000
     except Exception as e:
-        st.error(f"Model download failed: {e}")
+        st.error(f"Model download failed: {e}. Check Drive link is 'Anyone with the link'")
         return False
-
 
 @st.cache_resource
 def load_model():
@@ -109,13 +105,11 @@ def load_model():
     model.eval()
     return model
 
-
 def preprocess(pil_img: Image.Image):
     img = np.array(pil_img.convert("RGB"))
     tf = A.Compose([A.Resize(IMG_SIZE, IMG_SIZE), A.Normalize(), ToTensorV2()])
     tensor = tf(image=img)["image"]
     return tensor.unsqueeze(0), cv2.resize(img, (IMG_SIZE, IMG_SIZE))
-
 
 @torch.no_grad()
 def predict(model, tensor):
@@ -126,9 +120,8 @@ def predict(model, tensor):
     is_referable = pred_class in REFERABLE_CLASSES
     return pred_class, probs, is_referable, referable_prob
 
-
 # --------------------------------------------------------------------------
-# Grad-CAM: shows which regions of the retina influenced the prediction
+# Grad-CAM
 # --------------------------------------------------------------------------
 class GradCAM:
     def __init__(self, model, target_layer):
@@ -161,7 +154,6 @@ class GradCAM:
         heatmap = heatmap / (heatmap.max() + 1e-8)
         return heatmap
 
-
 def overlay_heatmap(base_img_rgb, heatmap, alpha=0.45):
     heatmap_resized = cv2.resize(heatmap, (base_img_rgb.shape[1], base_img_rgb.shape[0]))
     heatmap_uint8 = np.uint8(255 * heatmap_resized)
@@ -170,12 +162,10 @@ def overlay_heatmap(base_img_rgb, heatmap, alpha=0.45):
     overlay = cv2.addWeighted(base_img_rgb, 1 - alpha, heatmap_color, alpha, 0)
     return overlay
 
-
 @st.cache_resource
 def get_gradcam(_model):
     target_layer = _model.features[-1]
     return GradCAM(_model, target_layer)
-
 
 # --------------------------------------------------------------------------
 # Chart builders
@@ -193,7 +183,7 @@ def build_probability_bar(probs):
         )
     )
     fig.update_layout(
-        title="Stage-wise confidence",
+        title="Stage-wise confidence (Accuracy Graph)",
         xaxis_title="Probability (%)",
         xaxis=dict(range=[0, 100]),
         height=320,
@@ -201,7 +191,6 @@ def build_probability_bar(probs):
         plot_bgcolor="white",
     )
     return fig
-
 
 def build_confidence_donut(referable_prob, is_referable):
     non_ref = 100 - referable_prob * 100
@@ -227,9 +216,8 @@ def build_confidence_donut(referable_prob, is_referable):
     )
     return fig
 
-
 # --------------------------------------------------------------------------
-# UI
+# UI - FIXED width='stretch'
 # --------------------------------------------------------------------------
 st.title("🩺 Diabetic Retinopathy Screening")
 st.caption(
@@ -241,9 +229,8 @@ model = load_model()
 
 if model is None:
     st.error(
-        "Could not load model weights (auto-download from Google Drive failed). "
-        "Check that the Drive file is shared as 'Anyone with the link', "
-        "or manually place `best_qwk_final.pth` next to app.py and rerun."
+        "Could not load model weights. Check Drive file is shared as 'Anyone with the link' "
+        "or manually place `best_qwk_final.pth` next to app.py"
     )
     st.stop()
 
@@ -259,7 +246,6 @@ if uploaded:
         heatmap = gradcam.generate(tensor.clone(), pred_class)
         overlay_img = overlay_heatmap(resized_rgb, heatmap)
 
-    # ---- Headline badge ----
     if is_referable:
         st.markdown(
             f"""<div class="badge-yes">
@@ -272,7 +258,7 @@ if uploaded:
         st.markdown(
             f"""<div class="badge-no">
                     <h1>✅ Referable DR: NO</h1>
-                    <p>Routine monitoring recommended — confidence {(1-referable_prob)*100:.1f}%</p>
+                    <p>Routine monitoring — confidence {(1-referable_prob)*100:.1f}%</p>
                 </div>""",
             unsafe_allow_html=True,
         )
@@ -283,7 +269,7 @@ if uploaded:
     with tab_result:
         col_img, col_charts = st.columns([1, 1.3])
         with col_img:
-            st.image(pil_image, caption="Uploaded fundus image", use_container_width=True)
+            st.image(pil_image, caption="Uploaded fundus image", width='stretch')
             st.markdown(
                 f"""<div class="info-card">
                         <b>Predicted grade:</b> {CLASS_NAMES[pred_class]} (class {pred_class})<br>
@@ -292,32 +278,24 @@ if uploaded:
                 unsafe_allow_html=True,
             )
         with col_charts:
-            st.plotly_chart(build_probability_bar(probs), use_container_width=True)
-            st.plotly_chart(build_confidence_donut(referable_prob, is_referable), use_container_width=True)
+            st.plotly_chart(build_probability_bar(probs), width='stretch')
+            st.plotly_chart(build_confidence_donut(referable_prob, is_referable), width='stretch')
 
     with tab_attention:
         st.write(
-            "This heatmap (Grad-CAM) shows which regions of the retina the model "
-            "focused on most when making its prediction — red/yellow = high influence, "
-            "blue = low influence. It helps sanity-check that the model is looking at "
-            "actual retinal features (vessels, hemorrhages, exudates) rather than noise."
+            "Grad-CAM shows which regions influenced the prediction — red/yellow = high influence"
         )
         alpha = st.slider("Heatmap intensity", 0.0, 0.9, 0.45, 0.05)
         overlay_display = overlay_heatmap(resized_rgb, heatmap, alpha=alpha)
         c1, c2 = st.columns(2)
         with c1:
-            st.image(resized_rgb, caption="Original (preprocessed)", use_container_width=True)
+            st.image(resized_rgb, caption="Original (preprocessed)", width='stretch')
         with c2:
-            st.image(overlay_display, caption="AI attention map", use_container_width=True)
+            st.image(overlay_display, caption="AI attention map", width='stretch')
 
-    st.markdown("---")
     with st.expander("Raw probability table"):
         for c in range(5):
             st.write(f"**{CLASS_NAMES[c]}**: {probs[c]*100:.2f}%")
 
-    st.caption(
-        "This tool provides a screening-support estimate only. "
-        "It is not a substitute for professional medical diagnosis."
-    )
 else:
-    st.info("Upload a fundus image to get a prediction, charts, and an AI attention map.")
+    st.info("Upload a fundus image to get prediction, charts, and attention map.")
