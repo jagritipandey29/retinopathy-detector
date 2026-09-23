@@ -1,0 +1,40 @@
+# Diabetic Retinopathy Screening App
+
+Streamlit app that grades a retinal fundus image on the 5-stage DR scale
+(No DR / Mild / Moderate / Severe / Proliferative) and shows a headline
+**Referable DR: Yes/No** badge.
+
+Model weights (`best_qwk_final.pth`, EfficientNet-B4) are **not** stored in
+this repo — the app downloads them automatically from Google Drive on first
+run (see `GDRIVE_FILE_ID` in `app.py`).
+
+## Run locally
+
+```bash
+git clone <your-repo-url>
+cd <your-repo>
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+First run will download the model weights (~70-80MB) automatically; later
+runs use the cached local copy.
+
+## Deploy
+
+Works as-is on:
+- **Streamlit Community Cloud** — connect the repo, set `app.py` as the entrypoint, deploy.
+- **Hugging Face Spaces** (Streamlit SDK) — push this repo, no secrets needed since the Drive file is public link-shared.
+- Any VM/container — just `pip install -r requirements.txt && streamlit run app.py`.
+
+## Updating the model
+
+If you retrain and get a new `best_qwk_final.pth`:
+1. Upload the new file to Google Drive, share as "Anyone with the link".
+2. Copy its file ID (the part between `/d/` and `/view` in the share link).
+3. Replace `GDRIVE_FILE_ID` in `app.py` with the new ID.
+4. Delete any old cached `best_qwk_final.pth` on the deployment so it re-downloads.
+
+## Disclaimer
+
+This is a research/screening-support tool, not a certified diagnostic device.
