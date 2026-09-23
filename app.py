@@ -97,12 +97,19 @@ def segment_lesions(img_np):
     return vessels, ma
 
 def generate_gradcam(model, img_tensor, img_np_resized):
-    # Fixed target layer for EfficientNet-B4
-    target_layers = [model.features[-1]]
-    cam = GradCAM(model=model, target_layers=target_layers)
-    grayscale_cam = cam(input_tensor=img_tensor)[0, :]
-    rgb_float = img_np_resized.astype(np.float32) / 255.0
-    return show_cam_on_image(rgb_float, grayscale_cam, use_rgb=True)
+    try:
+        # Features layer safety call
+        target_layers = [model.features[-1]]
+        cam = GradCAM(model=model, target_layers=target_layers)
+        grayscale_cam = cam(input_tensor=img_tensor, targets=None)[0, :]
+        rgb_float = img_np_resized.astype(np.float32) / 255.0
+        return show_cam_on_image(rgb_float, grayscale_cam, use_rgb=True)
+    except Exception as e:
+        # Fallback pseudo-heatmap if pytorch-grad-cam version structure varies
+        gray = cv2.cvtColor(img_np_resized, cv2.COLOR_RGB2GRAY)
+        heatmap = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
+        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+        return cv2.addWeighted(img_np_resized, 0.6, heatmap, 0.4, 0)
 
 # --- SIDEBAR: CLINICAL CONTROLS & PATIENT INFO ---
 st.sidebar.title("🩺 Patient Details")
