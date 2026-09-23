@@ -6,3 +6,4 @@ opencv-python-headless>=4.8
 pillow>=10.0
 numpy>=1.24
 gdown>=5.1
+plotly>=5.18
