@@ -21,30 +21,38 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- CUSTOM CSS FOR CLINICAL DASHBOARD STYLING ---
+# --- CUSTOM CSS FOR DYNAMIC THEME SUPPORT (LIGHT & DARK BOTH) ---
 st.markdown("""
     <style>
-    .main { background-color: #0e1117; }
-    .stMetric {
-        background: #1e222d;
+    /* Metric Cards - Theme adaptive background & text */
+    [data-testid="stMetric"] {
+        background-color: var(--background-secondary-color);
+        border: 1px solid rgba(128, 128, 128, 0.2);
         padding: 15px;
         border-radius: 10px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     }
+    
+    /* Make metric label and value adapt to theme text color */
+    [data-testid="stMetricLabel"], [data-testid="stMetricValue"] {
+        color: var(--text-color) !important;
+    }
+
+    /* Dynamic Alert Banners */
     .status-card-danger {
-        background-color: #3b181a;
+        background-color: rgba(255, 75, 75, 0.15);
         border-left: 6px solid #ff4b4b;
         padding: 15px;
         border-radius: 8px;
-        color: #ff8888;
+        color: var(--text-color);
         font-weight: bold;
     }
     .status-card-success {
-        background-color: #12331c;
+        background-color: rgba(0, 200, 83, 0.15);
         border-left: 6px solid #00c853;
         padding: 15px;
         border-radius: 8px;
-        color: #81c784;
+        color: var(--text-color);
         font-weight: bold;
     }
     </style>
@@ -98,24 +106,38 @@ def segment_lesions(img_np):
 
 def generate_gradcam(model, img_tensor, img_np_resized):
     try:
-        # Features layer safety call
         target_layers = [model.features[-1]]
         cam = GradCAM(model=model, target_layers=target_layers)
         grayscale_cam = cam(input_tensor=img_tensor, targets=None)[0, :]
         rgb_float = img_np_resized.astype(np.float32) / 255.0
         return show_cam_on_image(rgb_float, grayscale_cam, use_rgb=True)
     except Exception as e:
-        # Fallback pseudo-heatmap if pytorch-grad-cam version structure varies
         gray = cv2.cvtColor(img_np_resized, cv2.COLOR_RGB2GRAY)
         heatmap = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
         heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
         return cv2.addWeighted(img_np_resized, 0.6, heatmap, 0.4, 0)
 
+# --- DYNAMIC URL PARAMETERS FETCH (For MATLAB / External Integration) ---
+query_params = st.query_params
+
+default_patient_id = query_params.get("patient_id", "PT-88392")
+try:
+    default_age = int(query_params.get("age", 54))
+except ValueError:
+    default_age = 54
+default_eye = query_params.get("eye", "Right Eye (OD)")
+logged_in_user = query_params.get("user_name", "Doctor / Operator")
+
+eye_index = 1 if "left" in default_eye.lower() or "os" in default_eye.lower() else 0
+
 # --- SIDEBAR: CLINICAL CONTROLS & PATIENT INFO ---
+st.sidebar.markdown(f"👨‍⚕️ **Active User:** {logged_in_user}")
+st.sidebar.markdown("---")
 st.sidebar.title("🩺 Patient Details")
-patient_id = st.sidebar.text_input("Patient ID", "PT-88392")
-patient_age = st.sidebar.number_input("Age", 18, 100, 54)
-eye_side = st.sidebar.selectbox("Eye Side", ["Right Eye (OD)", "Left Eye (OS)"])
+
+patient_id = st.sidebar.text_input("Patient ID", value=default_patient_id)
+patient_age = st.sidebar.number_input("Age", min_value=1, max_value=120, value=default_age)
+eye_side = st.sidebar.selectbox("Eye Side", ["Right Eye (OD)", "Left Eye (OS)"], index=eye_index)
 
 st.sidebar.markdown("---")
 st.sidebar.caption("🔒 Model: EfficientNet-B4 (Trained with QWK Loss)")
@@ -190,8 +212,6 @@ if uploaded_file is not None:
                 
             with col_chart:
                 st.subheader("Stage-wise Probability Distribution")
-                
-                # Plotly Horizontal Bar Chart
                 fig_bar = px.bar(
                     x=probs * 100,
                     y=labels,
